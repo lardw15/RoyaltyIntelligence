@@ -1,0 +1,2219 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Literal
+import hashlib
+import io
+import json
+import zipfile
+
+
+import numpy as np
+import pandas as pd
+
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Pt, Inches
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+
+
+# ============================================================
+# STEP 1: UNIVERSAL LOADER (CSV/TSV/TXT/XLSX/XLS/ZIP)
+# ============================================================
+
+TEXT_EXTS = {".csv", ".tsv", ".txt"}
+EXCEL_EXTS = {".xlsx", ".xls"}
+ZIP_EXTS = {".zip"}
+
+COMMON_ENCODINGS = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
+
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [
+        str(c)
+        .replace("\ufeff", "")  # remove BOM if present
+        .strip()
+        .lower()
+        .replace("\n", " ")
+        .replace("\r", " ")
+        .replace("/", "_")      # platform/org -> platform_org
+        .replace(" ", "_")
+        for c in df.columns
+    ]
+    return df
+
+
+def _try_read_text_table(data: bytes, sep: Optional[str] = None) -> pd.DataFrame:
+    """
+    Try reading bytes as delimited text using common encodings.
+    sep=None => pandas will infer delimiter with engine="python"
+    """
+    last_err = None
+    for enc in COMMON_ENCODINGS:
+        try:
+            s = data.decode(enc)
+            bio = io.StringIO(s)
+            df = pd.read_csv(
+                bio,
+                sep=sep,
+                engine="python",
+                dtype=str,       # keep as strings; coerce later
+                na_filter=False, # treat empty as ""
+            )
+            if df.shape[1] >= 1:
+                return df
+        except Exception as e:
+            last_err = e
+    raise ValueError(f"Could not read as text table with common encodings. Last error: {last_err}")
+
+
+def _read_excel_all_sheets(excel_file: Any) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Read ALL sheets in an Excel workbook and concatenate into one DataFrame.
+    Adds a 'sheet_name' column so we can trace each row back to its tab.
+    Returns (df, sheet_names).
+    """
+    xls = pd.ExcelFile(excel_file)
+    frames = []
+    sheet_names = list(xls.sheet_names)
+
+    for sheet in sheet_names:
+        df = pd.read_excel(xls, sheet_name=sheet, dtype=str, na_filter=False)
+        if df is None or df.empty:
+            continue
+        df["sheet_name"] = sheet
+        frames.append(df)
+
+    if not frames:
+        return pd.DataFrame(), sheet_names
+
+    return pd.concat(frames, ignore_index=True), sheet_names
+
+
+def load_statement_file(path_str: str) -> Tuple[pd.DataFrame, dict]:
+    """
+    Load manager-style uploads into a DataFrame.
+    Supports: CSV/TSV/TXT, XLSX/XLS, ZIP (containing supported files).
+    Returns (df, metadata)
+    """
+    path = Path(path_str)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    ext = path.suffix.lower()
+    meta = {"source_path": str(path), "source_type": ext}
+
+    # Excel
+    if ext in EXCEL_EXTS:
+        df, sheet_names = _read_excel_all_sheets(path)
+        df = _normalize_columns(df)
+
+        # Ensure we have ONE consistent lineage column name
+        # If your helper wrote "sheet_name", convert it to "_source_sheet"
+        if "sheet_name" in df.columns and "_source_sheet" not in df.columns:
+            df["_source_sheet"] = df["sheet_name"]
+            df.drop(columns=["sheet_name"], inplace=True)
+
+        meta["loaded_as"] = "excel_all_sheets"
+        meta["sheets"] = sheet_names
+        meta["sheet_count"] = len(sheet_names)
+
+        return df, meta
+
+    # Delimited text
+    if ext in TEXT_EXTS:
+        data = path.read_bytes()
+        sep = "\t" if ext == ".tsv" else None
+        df = _try_read_text_table(data, sep=sep)
+        df = _normalize_columns(df)
+        meta["loaded_as"] = "delimited_text"
+        return df, meta
+
+    # ZIP (choose first supported file inside)
+    if ext in ZIP_EXTS:
+        with zipfile.ZipFile(path, "r") as z:
+            members = [m for m in z.namelist() if not m.endswith("/")]
+            supported = [m for m in members if Path(m).suffix.lower() in (TEXT_EXTS | EXCEL_EXTS)]
+            if not supported:
+                raise ValueError("ZIP contained no supported files (.csv/.tsv/.txt/.xlsx/.xls).")
+
+            # Prefer Excel over CSV/text
+            supported.sort(key=lambda m: (Path(m).suffix.lower() not in EXCEL_EXTS, m))
+            chosen = supported[0]
+            meta["zip_member"] = chosen
+
+            data = z.read(chosen)
+            inner_ext = Path(chosen).suffix.lower()
+
+            if inner_ext in EXCEL_EXTS:
+                bio = io.BytesIO(data)
+                xls = pd.ExcelFile(bio)
+                dfs = []
+
+                for sheet in xls.sheet_names:
+                    df_sheet = pd.read_excel(xls, sheet_name=sheet, dtype=str, na_filter=False)
+                    df_sheet["_source_sheet"] = sheet
+                    dfs.append(df_sheet)
+
+                df = pd.concat(dfs, ignore_index=True)
+                df = _normalize_columns(df)
+
+                meta["loaded_as"] = "zip_excel_all_sheets"
+                meta["sheet"] = "ALL_SHEETS"
+
+                return df, meta
+
+            sep = "\t" if inner_ext == ".tsv" else None
+            df = _try_read_text_table(data, sep=sep)
+            df = _normalize_columns(df)
+            meta["loaded_as"] = "zip_delimited_text"
+            return df, meta
+
+    raise ValueError(
+        f"Unsupported file type: {ext}. Supported: {sorted(TEXT_EXTS | EXCEL_EXTS | ZIP_EXTS)}"
+    )
+
+
+# ============================================================
+# STEP 2: FINDING SCHEMA + HELPERS
+# ============================================================
+
+@dataclass
+class EvidenceRow:
+    row_index: int
+    fields: Dict[str, Any]
+
+
+@dataclass
+class Finding:
+    id: str
+    category: str
+    severity: str          # "High" | "Med" | "Low"
+    confidence: float      # 0.0 - 1.0
+    summary: str
+    recommended_action: str
+    evidence: List[EvidenceRow]
+
+
+def stable_id(*parts: str) -> str:
+    raw = "||".join([p or "" for p in parts])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def coerce_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        series.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("$", "", regex=False),
+        errors="coerce",
+    )
+
+
+def coerce_date(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce")
+
+
+def ensure_period_month(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensures df has 'period_month' as YYYY-MM string for grouping.
+    Prefers period_start; falls back to period_end.
+    """
+    df = df.copy()
+
+    if "period_start" in df.columns and np.issubdtype(df["period_start"].dtype, np.datetime64):
+        base = df["period_start"]
+    elif "period_end" in df.columns and np.issubdtype(df["period_end"].dtype, np.datetime64):
+        base = df["period_end"]
+    else:
+        df["period_month"] = None
+        return df
+
+    df["period_month"] = base.dt.to_period("M").astype(str)
+    return df
+
+
+def detect_amount_column(df: pd.DataFrame) -> str:
+    """
+    Detect an amount column in a manager export.
+    Prefers name hints; falls back to "most numeric" column.
+    """
+    cols = list(df.columns)
+
+    name_hints = [
+        "revenue_usd", "amount_usd", "usd",
+        "amount", "net_amount", "gross_amount",
+        "royalty", "earnings", "payable",
+        "revenue", "net_revenue", "gross_revenue",
+        "total", "payment", "value",
+    ]
+
+    # exact match first
+    for hint in name_hints:
+        if hint in cols:
+            return hint
+
+    # substring match
+    for c in cols:
+        c_low = c.lower()
+        if any(h in c_low for h in name_hints):
+            return c
+
+    # fallback: most numeric-like column
+    best_col = None
+    best_score = -1
+    for c in cols:
+        s = pd.to_numeric(
+            df[c].astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False),
+            errors="coerce",
+        )
+        score = int(s.notna().sum())
+        if score > best_score:
+            best_score = score
+            best_col = c
+
+    if best_col is None or best_score < max(5, int(0.05 * len(df))):
+        raise ValueError(
+            f"Could not reliably detect an amount column. "
+            f"Best numeric-like column was '{best_col}' with {best_score} numeric rows. "
+            f"Columns found: {cols}"
+        )
+
+    return best_col
+
+
+# ============================================================
+# STEP 3: CHECKS
+# ============================================================
+
+def check_negative_amounts(df: pd.DataFrame, amount_col: str) -> List[Finding]:
+    findings: List[Finding] = []
+    if amount_col not in df.columns:
+        return findings
+
+    neg = df[df[amount_col] < 0]
+    if len(neg) > 0:
+        ev_cols = [c for c in ["period_start", "period_end", "platform_org", "territory", amount_col] if c in df.columns]
+        ev = [EvidenceRow(int(i), {c: neg.loc[i, c] for c in ev_cols}) for i in neg.index.tolist()[:25]]
+
+        findings.append(
+            Finding(
+                id=stable_id("negative_amounts", str(len(neg))),
+                category="Negative amounts",
+                severity="Med",
+                confidence=0.85,
+                summary=f"{len(neg)} rows have negative amounts (refunds/chargebacks/adjustments).",
+                recommended_action="Confirm negatives are legitimate adjustments; if not, trace back to statement source and dispute with evidence.",
+                evidence=ev,
+            )
+        )
+
+    return findings
+
+
+def check_duplicates_summary(df: pd.DataFrame, amount_col: str) -> List[Finding]:
+    """
+    Duplicates for summary statements: same platform_org + territory + period_start + period_end (+ amount)
+    """
+    findings: List[Finding] = []
+    key_cols = [c for c in ["platform_org", "territory", "period_start", "period_end", amount_col] if c in df.columns]
+    if len(key_cols) < 3:
+        return findings
+
+    dup_mask = df.duplicated(subset=key_cols, keep=False)
+    dups = df[dup_mask]
+    if len(dups) == 0:
+        return findings
+
+    ev = [EvidenceRow(int(i), {c: dups.loc[i, c] for c in key_cols}) for i in dups.index.tolist()[:25]]
+
+    findings.append(
+        Finding(
+            id=stable_id("duplicates_summary", str(len(dups))),
+            category="Possible duplicate rows",
+            severity="Med" if len(dups) < 50 else "High",
+            confidence=0.8,
+            summary=f"{len(dups)} rows appear duplicated based on keys: {key_cols}.",
+            recommended_action="Confirm whether duplicates are legitimate repeats (e.g., multiple sources). If not, dedupe and quantify impact.",
+            evidence=ev,
+        )
+    )
+
+    return findings
+
+
+def check_suspicious_territories(df: pd.DataFrame) -> List[Finding]:
+    findings: List[Finding] = []
+    if "territory" not in df.columns:
+        return findings
+
+    terr = df["territory"].astype(str).str.strip()
+    terr_l = terr.str.lower()
+
+    suspicious = terr_l.isin({"", "unknown", "worldwide", "all", "global", "n/a", "na", "none"})
+    idxs = df.index[suspicious].tolist()
+
+    if idxs:
+        ev = [EvidenceRow(int(i), {"territory": df.loc[i, "territory"]}) for i in idxs[:25]]
+        findings.append(
+            Finding(
+                id=stable_id("suspicious_territories", str(len(idxs))),
+                category="Unclear territory reporting",
+                severity="Med",
+                confidence=0.7,
+                summary=f"{len(idxs)} rows use blank or catch-all territory values (e.g., Worldwide/Unknown).",
+                recommended_action="Confirm whether revenue should be split by individual territories and whether any splits are missing.",
+                evidence=ev,
+            )
+        )
+
+    return findings
+
+
+def check_missing_periods(df: pd.DataFrame) -> List[Finding]:
+    """
+    Flags gaps in period_start by (platform_org, territory).
+    For monthly data, a gap > ~35 days is a good heuristic.
+    """
+    findings: List[Finding] = []
+    required = {"platform_org", "territory", "period_start"}
+    if not required.issubset(df.columns):
+        return findings
+
+    if not np.issubdtype(df["period_start"].dtype, np.datetime64):
+        return findings
+
+    grouped = df.dropna(subset=["period_start"]).groupby(["platform_org", "territory"])
+    for (platform, territory), sub in grouped:
+        periods = sub["period_start"].sort_values().unique()
+        if len(periods) < 2:
+            continue
+
+        gaps: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+        for i in range(1, len(periods)):
+            delta_days = int((periods[i] - periods[i - 1]).days)
+            if delta_days > 35:
+                gaps.append((periods[i - 1], periods[i]))
+
+        if gaps:
+            ev = [
+                EvidenceRow(
+                    row_index=int(sub.index[0]),
+                    fields={
+                        "platform_org": platform,
+                        "territory": territory,
+                        "gap": f"{a.date()} → {b.date()}",
+                    },
+                )
+                for a, b in gaps[:10]
+            ]
+            findings.append(
+                Finding(
+                    id=stable_id("missing_periods", str(platform), str(territory)),
+                    category="Missing reporting periods",
+                    severity="High",
+                    confidence=0.8,
+                    summary=f"{platform} / {territory} has {len(gaps)} gap(s) between reported periods.",
+                    recommended_action="Request the missing statement(s) or confirm if reporting frequency changed for these period(s).",
+                    evidence=ev,
+                )
+            )
+
+    return findings
+
+
+def check_platform_revenue_outliers(df: pd.DataFrame, amount_col: str) -> List[Finding]:
+    """
+    Outliers by platform_org using IQR. Works well for summary data.
+    """
+    findings: List[Finding] = []
+    if "platform_org" not in df.columns or amount_col not in df.columns:
+        return findings
+
+    for platform, sub in df.groupby("platform_org"):
+        vals = sub[amount_col].dropna()
+        if len(vals) < 6:
+            continue
+
+        q1, q3 = np.percentile(vals, [25, 75])
+        iqr = q3 - q1
+        if iqr == 0:
+            continue
+
+        low, high = q1 - 3 * iqr, q3 + 3 * iqr
+        out = sub[(sub[amount_col] < low) | (sub[amount_col] > high)]
+        if len(out) == 0:
+            continue
+
+        ev_cols = [c for c in ["platform_org", "territory", "period_start", "period_end", amount_col] if c in df.columns]
+        ev = [EvidenceRow(int(i), {c: out.loc[i, c] for c in ev_cols}) for i in out.index.tolist()[:25]]
+
+        findings.append(
+            Finding(
+                id=stable_id("platform_outliers", str(platform)),
+                category="Platform revenue anomalies",
+                severity="Med",
+                confidence=0.75,
+                summary=f"{platform} shows unusually high/low revenue values compared to its own history.",
+                recommended_action="Review whether rate changes, missing territory splits, or one-off adjustments explain these anomalies.",
+                evidence=ev,
+            )
+        )
+
+    return findings
+
+
+def check_revenue_concentration(df: pd.DataFrame, amount_col: str) -> List[Finding]:
+    findings: List[Finding] = []
+    if amount_col not in df.columns:
+        return findings
+
+    total = float(df[amount_col].fillna(0).sum())
+    if total <= 0:
+        return findings
+
+    def _severity_for(share: float, total_amt: float) -> Tuple[str, float]:
+        severity = "Low"
+        confidence = 0.75
+
+        if share >= 0.95:
+            if total_amt >= 1_000_000:
+                return "High", 0.9
+            if total_amt >= 100_000:
+                return "Med", 0.85
+            return "Low", 0.8
+
+        if share >= 0.80:
+            if total_amt >= 1_000_000:
+                return "Med", 0.85
+            if total_amt >= 250_000:
+                return "Med", 0.8
+            return "Low", 0.75
+
+        return severity, confidence
+
+    # Platform concentration
+    if "platform_org" in df.columns:
+        plat = (
+            df.assign(_amt=df[amount_col].fillna(0))
+              .groupby("platform_org")["_amt"]
+              .sum()
+              .sort_values(ascending=False)
+        )
+        if not plat.empty:
+            top_plat = plat.head(5)
+            top_share = float(top_plat.iloc[0]) / total if total else 0.0
+            severity, conf = _severity_for(top_share, total)
+
+            ev = [EvidenceRow(row_index=0, fields={"platform_org": k, "revenue": float(v)}) for k, v in top_plat.items()]
+
+            summary = (
+                f"All reported revenue comes from {top_plat.index[0]}."
+                if len(top_plat) == 1
+                else f"Top platform contributes {top_share:.0%} of total revenue (top 5 shown)."
+            )
+
+            findings.append(
+                Finding(
+                    id=stable_id("revenue_concentration_platform"),
+                    category="Revenue concentration",
+                    severity=severity,
+                    confidence=conf,
+                    summary=summary,
+                    recommended_action=(
+                        "Use this to sanity-check expectations and prioritize deeper audits on the largest revenue sources. "
+                        "If this concentration is unexpected, confirm whether additional platform statements exist or whether the export was filtered."
+                    ),
+                    evidence=ev,
+                )
+            )
+
+    # Territory concentration
+    if "territory" in df.columns:
+        terr = (
+            df.assign(_amt=df[amount_col].fillna(0))
+              .groupby("territory")["_amt"]
+              .sum()
+              .sort_values(ascending=False)
+        )
+        if not terr.empty:
+            top_terr = terr.head(5)
+            top_share = float(top_terr.iloc[0]) / total if total else 0.0
+            severity, conf = _severity_for(top_share, total)
+
+            ev = [EvidenceRow(row_index=0, fields={"territory": k, "revenue": float(v)}) for k, v in top_terr.items()]
+
+            summary = (
+                f"All reported revenue comes from {top_terr.index[0]}."
+                if len(top_terr) == 1
+                else f"Top territory contributes {top_share:.0%} of total revenue (top 5 shown)."
+            )
+
+            findings.append(
+                Finding(
+                    id=stable_id("revenue_concentration_territory"),
+                    category="Revenue concentration",
+                    severity=severity,
+                    confidence=conf,
+                    summary=summary,
+                    recommended_action=(
+                        "Use this to verify major markets are present and consistent period-over-period. "
+                        "If this concentration is unexpected, confirm whether global territory splits or additional exports exist."
+                    ),
+                    evidence=ev,
+                )
+            )
+
+    return findings
+
+
+# ============================================================
+# STATEMENT TYPE + STANDARD SCHEMA
+# ============================================================
+
+StatementType = Literal["summary", "line_item", "ambiguous"]
+
+
+def _colset(df: pd.DataFrame) -> set[str]:
+    return set([c.lower().strip() for c in df.columns])
+
+
+def detect_statement_type(df: pd.DataFrame) -> StatementType:
+    cols = _colset(df)
+    nrows = len(df)
+
+    line_item_signals = {
+        "isrc", "upc", "track_title", "track", "track_name", "song", "song_title", "title",
+        "album", "artist", "composer", "writer",
+        "streams", "stream_count", "plays", "play_count", "units", "quantity",
+        "rate", "per_stream_rate", "unit_rate", "payout_rate",
+        "content_id", "video_id", "asset_id",
+    }
+
+    summary_signals = {
+        "platform_org", "platform", "service", "store",
+        "territory", "country", "region",
+        "period", "period_start", "period_end", "statement_date",
+        "revenue_usd", "amount", "net_amount", "earnings", "royalty", "total",
+    }
+
+    li_hits = len(cols.intersection(line_item_signals))
+    sum_hits = len(cols.intersection(summary_signals))
+
+    if li_hits >= 2:
+        return "line_item"
+
+    if nrows <= 25 and sum_hits >= 3 and li_hits == 0:
+        return "summary"
+
+    if nrows >= 200 and li_hits >= 1:
+        return "line_item"
+
+    return "ambiguous"
+
+
+def standardize_schema(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    cols = list(df.columns)
+
+    mapping = {
+        # Platform
+        "platform": "platform_org",
+        "service": "platform_org",
+        "store": "platform_org",
+        "dsp": "platform_org",
+        "partner": "platform_org",
+
+        # Territory
+        "country": "territory",
+        "region": "territory",
+        "market": "territory",
+        "territories": "territory",
+
+        # Period
+        "start_date": "period_start",
+        "periodstart": "period_start",
+        "from": "period_start",
+        "end_date": "period_end",
+        "periodend": "period_end",
+        "to": "period_end",
+        "statement_date": "period_end",
+
+        # Amount / earnings
+        "revenue": "amount",
+        "revenue_usd": "amount",
+        "net_revenue": "amount",
+        "gross_revenue": "amount",
+        "earnings": "amount",
+        "royalty": "amount",
+        "payable": "amount",
+        "net_amount": "amount",
+        "total": "amount",
+        "amount_usd": "amount",
+        "usd": "amount",
+
+        # Identifiers
+        "track": "track_title",
+        "track_name": "track_title",
+        "song": "track_title",
+        "song_title": "track_title",
+        "title": "track_title",
+        "isrc_code": "isrc",
+        "recording_isrc": "isrc",
+        "upc_code": "upc",
+
+        # Quantity
+        "streams": "quantity",
+        "stream_count": "quantity",
+        "plays": "quantity",
+        "play_count": "quantity",
+        "units": "quantity",
+        "unit_count": "quantity",
+        "qty": "quantity",
+
+        # Rate
+        "payout_rate": "rate",
+        "per_stream_rate": "rate",
+        "unit_rate": "rate",
+
+        # Currency
+        "ccy": "currency",
+        "curr": "currency",
+    }
+
+    rename = {}
+    for c in cols:
+        c_low = c.lower().strip()
+        if c_low in mapping:
+            rename[c] = mapping[c_low]
+
+    if rename:
+        df = df.rename(columns=rename)
+
+    return df
+
+
+def check_zero_or_blank_amounts(df: pd.DataFrame, amount_col: str) -> List[Finding]:
+    findings: List[Finding] = []
+    if amount_col not in df.columns:
+        return findings
+
+    amt = df[amount_col].fillna(0)
+    mask = (amt == 0) | (~np.isfinite(amt))
+    bad = df[mask]
+
+    if len(bad) > 0:
+        ev_cols = [c for c in ["platform_org", "territory", "period_start", "period_end", "track_title", "isrc", amount_col] if c in df.columns]
+        ev = [EvidenceRow(int(i), {c: bad.loc[i, c] for c in ev_cols}) for i in bad.index.tolist()[:25]]
+        findings.append(
+            Finding(
+                id=stable_id("zero_amounts", str(len(bad))),
+                category="Zero/blank earnings lines",
+                severity="Low" if len(bad) < 50 else "Med",
+                confidence=0.7,
+                summary=f"{len(bad)} rows have zero/blank earnings. This may be normal (promos/rounding) or may indicate missing rates or incomplete reporting.",
+                recommended_action="Spot-check a sample: confirm these rows have expected usage/quantity and correct rate/earnings calculations.",
+                evidence=ev,
+            )
+        )
+    return findings
+
+
+def check_missing_line_item_ids(df: pd.DataFrame) -> List[Finding]:
+    findings: List[Finding] = []
+    id_cols = [c for c in ["isrc", "track_title", "upc"] if c in df.columns]
+    if not id_cols:
+        return findings
+
+    mask = df[id_cols].isna() | (df[id_cols].astype(str).apply(lambda col: col.str.strip() == ""))
+    all_missing = mask.all(axis=1)
+    idxs = df.index[all_missing].tolist()
+
+    if idxs:
+        ev = [EvidenceRow(int(i), {c: df.loc[i, c] for c in id_cols}) for i in idxs[:25]]
+        findings.append(
+            Finding(
+                id=stable_id("missing_line_item_ids", str(len(idxs))),
+                category="Missing track identifiers",
+                severity="Med" if len(idxs) < 100 else "High",
+                confidence=0.85,
+                summary=f"{len(idxs)} line-item rows are missing key identifiers (ISRC/title/UPC), limiting matching and recovery workflows.",
+                recommended_action="Fill identifiers where possible (prefer ISRC). If unavailable, map titles to a canonical catalog list.",
+                evidence=ev,
+            )
+        )
+    return findings
+
+
+def check_rate_math(df: pd.DataFrame, amount_col: str) -> List[Finding]:
+    findings: List[Finding] = []
+    if amount_col not in df.columns or "quantity" not in df.columns or "rate" not in df.columns:
+        return findings
+
+    qty = coerce_numeric(df["quantity"])
+    rate = coerce_numeric(df["rate"])
+    amt = df[amount_col]
+
+    expected = qty * rate
+    mask = expected.notna() & amt.notna() & qty.notna() & rate.notna()
+    if mask.sum() < 10:
+        return findings
+
+    denom = expected.abs().replace(0, np.nan)
+    rel_err = (amt - expected).abs() / denom
+    bad_mask = rel_err > 0.05
+
+    bad_idxs = df.index[mask & bad_mask].tolist()
+    if bad_idxs:
+        ev_cols = [c for c in ["platform_org", "territory", "period_start", "track_title", "isrc", "quantity", "rate", amount_col] if c in df.columns]
+        ev = [EvidenceRow(int(i), {c: df.loc[i, c] for c in ev_cols}) for i in bad_idxs[:25]]
+        findings.append(
+            Finding(
+                id=stable_id("rate_math_mismatch", str(len(bad_idxs))),
+                category="Rate × quantity mismatches",
+                severity="Med",
+                confidence=0.75,
+                summary=f"{len(bad_idxs)} rows deviate from earnings ≈ quantity × rate beyond tolerance.",
+                recommended_action="Verify whether amounts include fees/adjustments, currency conversion, or whether rate/quantity columns represent different units.",
+                evidence=ev,
+            )
+        )
+    return findings
+
+
+def build_royalty_stream_coverage(df: pd.DataFrame, statement_type: str) -> List[Dict[str, Any]]:
+    cols = set(df.columns)
+    has_platform = "platform_org" in cols
+    has_amount = "amount" in cols
+    has_territory = "territory" in cols
+
+    master_streaming_present = bool(has_amount and has_platform)
+
+    coverage = [
+        {
+            "stream": "Interactive Streaming (Master)",
+            "represented_in_upload": True if master_streaming_present else "Unknown",
+            "usually_reported_by": "Distributor / Label",
+            "notes": "Typically includes DSPs like Spotify/Apple/Amazon/YouTube Music depending on distribution footprint.",
+        },
+        {
+            "stream": "Digital Downloads (Master)",
+            "represented_in_upload": False,
+            "usually_reported_by": "Distributor / Label",
+            "notes": "Often separate line items; may not appear if no download sales occurred.",
+        },
+        {
+            "stream": "Physical Sales (Master)",
+            "represented_in_upload": False,
+            "usually_reported_by": "Distributor / Label",
+            "notes": "Applicable only if physical products are sold (CD/vinyl).",
+        },
+        {
+            "stream": "Non-interactive Digital Performance (Master)",
+            "represented_in_upload": False,
+            "usually_reported_by": "SoundExchange (US) / digital radio services",
+            "notes": "Typically reported outside distributor statements; timing varies.",
+        },
+        {
+            "stream": "International Neighboring Rights (Master)",
+            "represented_in_upload": False,
+            "usually_reported_by": "Foreign neighboring rights societies (PPL, GVL, etc.)",
+            "notes": "Territory-dependent; often delayed; requires correct registrations.",
+        },
+        {
+            "stream": "Mechanical Royalties (Composition)",
+            "represented_in_upload": False,
+            "usually_reported_by": "MLC (US) / mechanical societies / publisher",
+            "notes": "Commonly generated by streaming/downloads; often not included in distributor revenue exports.",
+        },
+        {
+            "stream": "Performance Royalties (Composition)",
+            "represented_in_upload": False,
+            "usually_reported_by": "PROs (ASCAP/BMI/SESAC, PRS, SACEM, etc.)",
+            "notes": "Reported separately; territory-dependent; frequently delayed vs. streaming statements.",
+        },
+        {
+            "stream": "Synchronization (Sync Licensing)",
+            "represented_in_upload": "Unknown",
+            "usually_reported_by": "Publisher / licensing entity",
+            "notes": "Only applicable if placements exist (film/TV/ads/games).",
+        },
+        {
+            "stream": "UGC / Content ID Monetization",
+            "represented_in_upload": "Unknown",
+            "usually_reported_by": "YouTube/Meta CMS or distributor/CMS partner",
+            "notes": "Depends on rights setup and claims; often separate from DSP streaming exports.",
+        },
+    ]
+
+    if statement_type == "summary" and master_streaming_present and has_territory:
+        for item in coverage:
+            if item["stream"] == "Interactive Streaming (Master)":
+                item["notes"] += " This upload looks like a summary statement (aggregated)."
+
+    return coverage
+
+
+def build_contextual_range_estimates(total_streaming_amount: float) -> List[Dict[str, Any]]:
+    base = float(total_streaming_amount or 0.0)
+    if base <= 0:
+        return []
+
+    def rng(lo: float, hi: float) -> Dict[str, float]:
+        return {"low": round(base * lo, 2), "high": round(base * hi, 2)}
+
+    return [
+        {
+            "stream": "Mechanical Royalties (Composition)",
+            "typical_percent_of_streaming": "8%–15%",
+            "estimated_range_usd": rng(0.08, 0.15),
+            "confidence": "Medium",
+            "methodology_note": "Contextual range based on typical mechanical outcomes for interactive streaming; varies by songwriter share, splits, registrations, and territory.",
+        },
+        {
+            "stream": "Performance Royalties (Composition)",
+            "typical_percent_of_streaming": "3%–8%",
+            "estimated_range_usd": rng(0.03, 0.08),
+            "confidence": "Medium",
+            "methodology_note": "Contextual range based on typical PRO distributions for comparable catalogs; reporting timelines vary and may be delayed.",
+        },
+        {
+            "stream": "Non-interactive Digital Performance (Master)",
+            "typical_percent_of_streaming": "2%–5%",
+            "estimated_range_usd": rng(0.02, 0.05),
+            "confidence": "Low–Medium",
+            "methodology_note": "Applies if non-interactive digital radio usage exists (e.g., Pandora radio, SiriusXM, web radio); often reported separately.",
+        },
+        {
+            "stream": "International Neighboring Rights (Master)",
+            "typical_percent_of_streaming": "1%–4%",
+            "estimated_range_usd": rng(0.01, 0.04),
+            "confidence": "Low",
+            "methodology_note": "Highly dependent on territory, repertoire, and registrations; often delayed and collected via foreign societies.",
+        },
+    ]
+
+
+def build_prioritized_opportunities(estimated_ranges: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not estimated_ranges:
+        return []
+
+    confidence_weight = {
+        "High": 1.0,
+        "Medium": 0.75,
+        "Low–Medium": 0.6,
+        "Low": 0.4,
+    }
+
+    ranked = []
+    for item in estimated_ranges:
+        low = item["estimated_range_usd"]["low"]
+        high = item["estimated_range_usd"]["high"]
+        midpoint = (low + high) / 2
+
+        conf = item.get("confidence", "Low")
+        weight = confidence_weight.get(conf, 0.5)
+        score = midpoint * weight
+
+        ranked.append({
+            "stream": item["stream"],
+            "estimated_midpoint_usd": round(midpoint, 2),
+            "confidence": conf,
+            "priority_score": round(score, 2),
+        })
+
+    ranked.sort(key=lambda x: x["priority_score"], reverse=True)
+    for i, r in enumerate(ranked, start=1):
+        r["priority_rank"] = i
+
+    return ranked
+
+
+def check_missing_expected_platforms(df: pd.DataFrame, amount_col: str) -> List[Finding]:
+    findings: List[Finding] = []
+    if "platform_org" not in df.columns or amount_col not in df.columns:
+        return findings
+
+    total = float(df[amount_col].fillna(0).sum())
+    if total <= 0:
+        return findings
+
+    platforms = (
+        df["platform_org"].astype(str).str.strip().replace({"": np.nan}).dropna()
+    )
+
+    unique_platforms = sorted(set(platforms.tolist()))
+    if len(unique_platforms) != 1:
+        return findings
+
+    only_platform = unique_platforms[0]
+
+    if total >= 1_000_000:
+        severity = "High"
+        confidence = 0.9
+    elif total >= 100_000:
+        severity = "Med"
+        confidence = 0.85
+    else:
+        severity = "Low"
+        confidence = 0.75
+
+    findings.append(
+        Finding(
+            id=stable_id("missing_expected_platforms", only_platform),
+            category="Coverage gap risk",
+            severity=severity,
+            confidence=confidence,
+            summary=(
+                f"Revenue is concentrated in a single platform ({only_platform}) "
+                f"representing ${total:,.2f}. "
+                "If multi-platform distribution exists, confirm whether additional statements are missing."
+            ),
+            recommended_action=(
+                "Confirm coverage across Apple Music, Amazon Music, YouTube Music, Pandora, "
+                "and other DSPs where applicable. Upload additional statements to expand scope."
+            ),
+            evidence=[EvidenceRow(row_index=0, fields={"platform_org": only_platform, "total_reported": round(total, 2)})],
+        )
+    )
+
+    if "territory" in df.columns:
+        territories = df["territory"].astype(str).str.strip().replace({"": np.nan}).dropna()
+        unique_territories = sorted(set(territories.tolist()))
+        if len(unique_territories) == 1:
+            only_territory = unique_territories[0]
+
+            if total >= 1_000_000:
+                terr_severity, terr_confidence = "High", 0.85
+            elif total >= 100_000:
+                terr_severity, terr_confidence = "Med", 0.8
+            else:
+                terr_severity, terr_confidence = "Low", 0.7
+
+            findings.append(
+                Finding(
+                    id=stable_id("single_territory_export", only_platform, only_territory),
+                    category="Territory concentration risk",
+                    severity=terr_severity,
+                    confidence=terr_confidence,
+                    summary=(
+                        f"Revenue is reported from a single territory ({only_territory}). "
+                        "If international activity is expected, confirm whether global reporting is included."
+                    ),
+                    recommended_action=(
+                        "Verify whether additional territory splits or global exports are available "
+                        "for the same reporting period."
+                    ),
+                    evidence=[EvidenceRow(row_index=0, fields={"territory": only_territory})],
+                )
+            )
+
+    return findings
+
+
+def build_top_revenue_drivers(df: pd.DataFrame, amount_col: str, top_n: int = 10) -> List[Dict[str, Any]]:
+    if amount_col not in df.columns:
+        return []
+
+    key_cols = []
+    if "isrc" in df.columns:
+        key_cols.append("isrc")
+    if "track_title" in df.columns:
+        key_cols.append("track_title")
+    if not key_cols:
+        return []
+
+    work_col = "isrc" if "isrc" in df.columns else "track_title"
+
+    tmp = df.copy()
+    tmp["_amt"] = tmp[amount_col].fillna(0)
+
+    group_cols = [work_col]
+    if "platform_org" in tmp.columns:
+        group_cols.append("platform_org")
+    if "territory" in tmp.columns:
+        group_cols.append("territory")
+
+    agg = (
+        tmp.groupby(group_cols, dropna=False)["_amt"]
+        .sum()
+        .reset_index()
+        .sort_values("_amt", ascending=False)
+        .head(top_n)
+    )
+
+    results: List[Dict[str, Any]] = []
+    for _, row in agg.iterrows():
+        work_id = str(row.get(work_col, ""))
+
+        item = {
+            "work_id": work_id,
+            "track_title": str(row.get("track_title", work_id)),
+            "platform_org": str(row.get("platform_org", "")),
+            "territory": str(row.get("territory", "")),
+            "amount_usd": float(row["_amt"]),
+        }
+
+        if "track_title" in df.columns and work_col != "track_title":
+            isrc_val = row.get("isrc")
+            if isrc_val is not None:
+                titles = df[df["isrc"] == isrc_val]["track_title"].astype(str).str.strip()
+                if len(titles) > 0:
+                    item["track_title"] = titles.value_counts().index[0]
+
+        results.append(item)
+
+    return results
+
+
+# ============================================================
+# TREND INTELLIGENCE (CROSS-PERIOD)
+# ============================================================
+
+@dataclass
+class TrendSignal:
+    signal_type: str
+    severity_score: float
+    confidence: float
+    direction: str
+    summary: str
+    recommended_action: str
+    evidence: Dict[str, Any]
+
+
+def _clip01(x: float) -> float:
+    return float(max(0.0, min(1.0, x)))
+
+def severity_label(score: float) -> str:
+    """
+    Converts 0.0–1.0 score into user-friendly severity buckets.
+    """
+    s = float(score or 0.0)
+    if s >= 0.75:
+        return "High"
+    if s >= 0.40:
+        return "Med"
+    return "Low"
+
+
+def confidence_label(score: float) -> str:
+    """
+    Converts 0.0–1.0 into user-friendly confidence buckets.
+    """
+    c = float(score or 0.0)
+    if c >= 0.85:
+        return "High"
+    if c >= 0.65:
+        return "Med"
+    return "Low"
+
+
+
+def _linear_slope(y: np.ndarray) -> float:
+    n = len(y)
+    if n < 2:
+        return 0.0
+    x = np.arange(n, dtype=float)
+    x_mean = x.mean()
+    y_mean = float(np.mean(y))
+    num = float(np.sum((x - x_mean) * (y - y_mean)))
+    den = float(np.sum((x - x_mean) ** 2))
+    return 0.0 if den == 0 else num / den
+
+
+def classify_behavior(series: np.ndarray) -> Dict[str, Any]:
+    """
+    Classify a revenue series into simple behavior buckets using:
+    - normalized slope (trend)
+    - volatility (coefficient of variation)
+    """
+    s = np.array(series, dtype=float)
+    s = s[np.isfinite(s)]
+
+    if len(s) < 4:
+        return {
+            "label": "insufficient_data",
+            "slope_normalized": 0.0,
+            "volatility_cv": 0.0,
+        }
+
+    mean = float(np.mean(s))
+    mean = mean if mean != 0 else 1e-9
+
+    slope = _linear_slope(s)  # uses your existing helper
+    slope_norm = float(slope / mean)
+
+    std = float(np.std(s))
+    cv = float(std / mean) if mean > 0 else 0.0
+
+    # Simple rules
+    if cv >= 0.35:
+        label = "volatile"
+    elif slope_norm >= 0.05:
+        label = "increasing"
+    elif slope_norm <= -0.05:
+        label = "declining"
+    else:
+        label = "stable"
+
+    return {
+        "label": label,
+        "slope_normalized": slope_norm,
+        "volatility_cv": cv,
+    }
+
+
+def compute_revenue_risk_level(trend: Dict[str, Any] | None) -> Dict[str, Any]:
+    trend = trend or {}
+    signals = trend.get("signals", []) or []
+    """
+    Converts trend_intelligence signals into a single user-friendly takeaway.
+    """
+    signals = trend.get("signals", []) or []
+
+    drivers: List[str] = []
+    level = "Low"
+
+    # If any behavior/trajectory says declining OR severity is high, escalate
+    for s in signals:
+        st = (s.get("signal_type") or "").strip()
+        direction = (s.get("direction") or "").strip().lower()
+        sev = (s.get("severity") or "").strip()
+
+        if st == "REVENUE_TRAJECTORY" and direction == "decreasing":
+            drivers.append("Revenue trending downward")
+            level = "Moderate" if level == "Low" else level
+
+        if st == "PORTFOLIO_BEHAVIOR" and direction == "volatile":
+            drivers.append("Unstable revenue behavior (volatility)")
+            level = "Moderate" if level == "Low" else level
+
+        # If we ever label something High severity, bump overall level
+        if sev == "High":
+            level = "High"
+
+    # Meaning text (what a manager understands instantly)
+    meaning_map = {
+        "Low": (
+            "Revenue looks relatively stable across the months analyzed. "
+            "No urgent signals detected, but you can still investigate small gaps if desired."
+        ),
+        "Moderate": (
+            "Revenue behavior shows instability or early decline signals. "
+            "Investigation is recommended, but no critical structural failures were detected."
+        ),
+        "High": (
+            "Revenue signals suggest a material decline or high-risk instability. "
+            "Prioritize investigation immediately and validate completeness of reporting coverage."
+        ),
+    }
+
+    # Action text (where to start)
+    action_map = {
+        "Low": (
+            "Confirm registrations are complete (MLC/PROs) and ensure all expected platforms are represented. "
+            "If desired, use Top Revenue Drivers to prioritize smaller recovery opportunities."
+        ),
+        "Moderate": (
+            "Check whether any months, platforms, or territories are missing, then verify platform mix changes "
+            "and adjustments. Request line-item exports if you only have summary-level data."
+        ),
+        "High": (
+            "Validate missing periods, confirm platform coverage, and reconcile rate or usage changes. "
+            "Immediately request the most detailed line-item export available."
+        ),
+    }
+
+    # De-dupe driver list but keep order
+    drivers = list(dict.fromkeys([d for d in drivers if d]))
+
+    return {
+        "revenue_risk_level": level,
+        "meaning": meaning_map[level],
+        "key_drivers": drivers,
+        "recommended_start": action_map[level],
+    }
+
+
+
+def compute_trend_intelligence(df: pd.DataFrame, amount_col: str) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "window_months": 0,
+        "signals": [],
+        "platform_behavior": [],
+        "territory_behavior": [],
+    }
+
+    if "period_month" not in df.columns:
+        return out
+
+    d = df.dropna(subset=["period_month"]).copy()
+    if d.empty:
+        return out
+
+    monthly = (
+        d.groupby("period_month")[amount_col]
+        .sum()
+        .reset_index()
+        .sort_values("period_month")
+    )
+
+    monthly = monthly.rename(columns={amount_col: "revenue"})
+    out["window_months"] = int(len(monthly))
+    monthly["period_month"] = monthly["period_month"].astype(str)  # JSON-safe + consistent labels
+
+    months_list = monthly["period_month"].tolist()
+
+    # Keep your existing range object (good for the report)
+    out["period_range"] = {
+        "start": months_list[0] if months_list else None,
+        "end": months_list[-1] if months_list else None,
+    }
+
+    # Add a human-friendly window label (best for executive text)
+    out["window_start_month"] = out["period_range"]["start"]
+    out["window_end_month"] = out["period_range"]["end"]
+    out["window_label"] = (
+        f"{out['window_start_month']} → {out['window_end_month']}"
+        if out["window_start_month"] and out["window_end_month"]
+        else None
+    )
+
+    # Keep your monthly detail list (great for showing evidence)
+    out["monthly_revenue"] = [
+        {"period_month": str(m), "revenue": float(r)}
+        for m, r in zip(monthly["period_month"], monthly["revenue"])
+    ]
+
+    if len(monthly) < 4:
+        return out
+
+    # ---------- Portfolio behavior ----------
+    portfolio_series = monthly["revenue"].to_numpy(dtype=float)
+    out["portfolio_behavior"] = classify_behavior(portfolio_series)
+
+    # Also emit a signal if it's declining or volatile
+    pb = out["portfolio_behavior"] or {}
+    pb_label = pb.get("label")
+    if pb_label in {"declining", "volatile"}:
+        sev_score = 0.85 if pb_label == "declining" else 0.70
+        conf_score = 0.90
+
+        out["signals"].append({
+            "signal_type": "PORTFOLIO_BEHAVIOR",
+            "severity": severity_label(sev_score),
+            "confidence": confidence_label(conf_score),
+            "direction": pb_label,
+            "summary": (
+                "Portfolio revenue is declining across the reporting window."
+                if pb_label == "declining"
+                else "Portfolio revenue is volatile across the reporting window."
+            ),
+            "recommended_action": (
+                "Investigate whether this is driven by missing months, platform mix shifts, "
+                "territory changes, or rate/usage issues."
+            ),
+            "evidence": pb,
+        })
+
+    # ---------- Portfolio revenue trajectory (your existing slope logic) ----------
+    N = min(6, len(monthly))
+    slope = _linear_slope(monthly["revenue"].tail(N).to_numpy(dtype=float))
+    mean_rev = float(monthly["revenue"].tail(N).mean())
+    slope_norm = 0.0 if mean_rev <= 0 else float(slope / mean_rev)
+
+    severity = _clip01(abs(slope_norm) * 8)
+    if severity >= 0.25:
+        direction = "increasing" if slope > 0 else "decreasing"
+        conf_score = _clip01(0.65 + min(0.25, abs(slope_norm) * 2))
+
+        out["signals"].append({
+            "signal_type": "REVENUE_TRAJECTORY",
+            "severity": severity_label(severity),
+            "confidence": confidence_label(conf_score),
+            "direction": direction,
+            "summary": (
+                f"Revenue increased from {out.get('window_start_month')} "
+                f"to {out.get('window_end_month')}."
+                if direction == "increasing"
+                else
+                f"Revenue decreased from {out.get('window_start_month')} "
+                f"to {out.get('window_end_month')}."
+            ),
+            "recommended_action": "Validate completeness and check for structural changes in platform or territory mix.",
+            "evidence": {
+                "months_analyzed": N,
+                "window": out.get("window_label"),
+                "slope_normalized": slope_norm,
+            },
+        })
+
+    # ---------- Platform level behavior ----------
+    if "platform_org" in d.columns:
+        platform_grouped = (
+            d.groupby(["platform_org", "period_month"])[amount_col]
+            .sum()
+            .reset_index()
+        )
+
+        for platform, sub in platform_grouped.groupby("platform_org"):
+            sub = sub.sort_values("period_month")
+            if len(sub) < 4:
+                continue
+
+            series = sub[amount_col].to_numpy(dtype=float)
+            behavior = classify_behavior(series)
+
+            out["platform_behavior"].append({
+                "platform": platform,
+                **behavior,
+            })
+    # ---------- Territory behavior + disappearance ----------
+    if "territory" in d.columns:
+        territory_grouped = (
+            d.groupby(["territory", "period_month"])[amount_col]
+            .sum()
+            .reset_index()
+        )
+
+        # portfolio total for relative materiality
+        portfolio_total = float(monthly["revenue"].sum())
+        last_month = months_list[-1] if months_list else None  # strings (you casted earlier)
+
+        # Thresholds (tweak later)
+        ABS_MATERIAL_USD = 50_000.0
+        REL_MATERIAL_SHARE = 0.10
+        EPS = 1e-9
+
+        # We will align each territory to the full window months_list
+        for territory, sub in territory_grouped.groupby("territory"):
+            sub = sub.sort_values("period_month").copy()
+            sub["period_month"] = sub["period_month"].astype(str)
+
+            # Build aligned series across the full window (missing months => 0)
+            month_to_val = dict(zip(sub["period_month"].tolist(), sub[amount_col].astype(float).tolist()))
+            aligned = [float(month_to_val.get(m, 0.0)) for m in months_list]
+
+            # Behavior (optional watchlist)
+            if len(aligned) >= 4:
+                behavior = classify_behavior(np.array(aligned, dtype=float))
+                out.setdefault("territory_behavior", []).append({
+                    "territory": str(territory),
+                    **behavior,
+                })
+
+            # Disappearance detection (signal)
+            if len(aligned) < 4 or not last_month:
+                continue
+
+            last_val = float(aligned[-1])
+            prior_vals = np.array(aligned[:-1], dtype=float)
+
+            prior_total = float(np.nansum(prior_vals))
+            prior_mean = float(np.nanmean(prior_vals)) if len(prior_vals) else 0.0
+            prior_nonzero_months = int(np.sum(prior_vals > EPS))
+
+            share_of_portfolio = (prior_total / portfolio_total) if portfolio_total > 0 else 0.0
+
+            is_material = (prior_total >= ABS_MATERIAL_USD) or (share_of_portfolio >= REL_MATERIAL_SHARE)
+
+            # Reduce false positives:
+            # - must have appeared in at least 2 prior months
+            # - and now last month is ~0
+            disappeared = (last_val <= EPS) and (prior_total > EPS) and (prior_nonzero_months >= 2)
+
+            if is_material and disappeared and last_month:
+                share_pct = round(float(share_of_portfolio) * 100, 1)
+
+                out["signals"].append({
+                    "signal_type": "TERRITORY_DISAPPEARANCE",
+                    "severity": "High",
+                    "confidence": "High",
+                    "direction": "disappeared",
+                    "summary": (
+                        f"{territory} revenue dropped to $0 in {last_month} "
+                        f"after averaging ${prior_mean:,.0f} per month in prior periods. "
+                        f"This territory represented approximately {share_pct}% of portfolio revenue prior to disappearance."
+                    ),
+                    "recommended_action": (
+                        "Confirm whether this is a reporting gap, a distribution/rights change, "
+                        "or a territory mapping issue. Verify the territory appears in source statements "
+                        "and check whether the platform export was filtered."
+                    ),
+                    "evidence": {
+                        "territory": str(territory),
+                        "last_month": str(last_month),
+                        "last_month_revenue": float(last_val),
+                        "prior_months_total": float(prior_total),
+                        "prior_months_avg": float(prior_mean),
+                        "prior_share_of_portfolio": round(float(share_of_portfolio), 4),
+                        "window": out.get("window_label"),
+                    },
+                })
+
+    # ---------- Final return (JSON-safe) ----------
+    return {
+        "window_months": int(out.get("window_months", 0)),
+
+        # ✅ add these so the report + quick check can display the window
+        "window_start_month": out.get("window_start_month"),
+        "window_end_month": out.get("window_end_month"),
+        "window_label": out.get("window_label"),
+
+        "period_range": out.get("period_range"),
+        "monthly_revenue": out.get("monthly_revenue", []),
+        "portfolio_behavior": out.get("portfolio_behavior"),
+        "platform_behavior": out.get("platform_behavior", []),
+        "territory_behavior": out.get("territory_behavior", []),
+        "signals": out.get("signals", []),
+    }
+
+# ============================================================
+# COMPOSITE FINANCIAL EXPOSURE SCORING
+# ============================================================
+
+def compute_financial_exposure(report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Produces a composite financial exposure rating based on:
+    - Structural findings
+    - Trend intelligence
+    - Revenue concentration
+    """
+
+    score = 0.0
+    drivers = []
+
+    # -------------------------
+    # 1) Structural Findings
+    # -------------------------
+    findings = report.get("findings", []) or []
+    for f in findings:
+        sev = f.get("severity")
+        category = f.get("category", "")
+
+        if sev == "High":
+            score += 2.0
+            drivers.append(category)
+        elif sev == "Med":
+            score += 1.0
+
+    # -------------------------
+    # 2) Trend Intelligence
+    # -------------------------
+    trend = report.get("trend_intelligence", {}) or {}
+    signals = trend.get("signals", []) or []
+
+    for s in signals:
+        direction = s.get("direction")
+        sig_type = s.get("signal_type")
+
+        if sig_type == "PORTFOLIO_BEHAVIOR" and direction in {"declining", "volatile"}:
+            score += 2.0
+            drivers.append("Unstable portfolio revenue behavior")
+
+        if sig_type == "REVENUE_TRAJECTORY" and direction == "decreasing":
+            score += 1.5
+            drivers.append("Revenue trending downward")
+
+    # -------------------------
+    # 3) Concentration Risk
+    # -------------------------
+    for f in findings:
+        if f.get("category") == "Revenue concentration" and f.get("severity") == "High":
+            score += 2.0
+            drivers.append("High revenue concentration")
+
+    # -------------------------
+    # Normalize Score
+    # -------------------------
+    if score >= 6:
+        label = "Critical"
+    elif score >= 4:
+        label = "Elevated"
+    elif score >= 2:
+        label = "Moderate"
+    else:
+        label = "Low"
+
+    # Meaning descriptions
+    meaning_map = {
+        "Low": "Revenue appears structurally stable with no significant behavioral or concentration risks detected.",
+        "Moderate": "Revenue behavior shows instability or early decline signals. Investigation is recommended, but no critical structural failures were detected.",
+        "Elevated": "Multiple behavioral or structural risk signals detected. Revenue may be materially exposed to concentration, decline, or reporting gaps.",
+        "Critical": "Significant financial risk indicators detected. Immediate investigation into reporting completeness and revenue stability is strongly recommended.",
+    }
+
+    return {
+        "exposure_label": label,
+        "exposure_score": round(score, 2),
+        "meaning": meaning_map.get(label),
+        "key_drivers": list(dict.fromkeys(drivers))[:5],
+    }
+
+
+# ============================================================
+# ANALYZE + OUTPUT REPORT
+# ============================================================
+
+def analyze_dataframe(df: pd.DataFrame, load_meta: dict) -> Dict[str, Any]:
+    df = standardize_schema(df)
+    statement_type = detect_statement_type(df)
+
+    print("COLUMNS:", list(df.columns))
+
+    if "period_start" in df.columns:
+        df["period_start"] = coerce_date(df["period_start"])
+    if "period_end" in df.columns:
+        df["period_end"] = coerce_date(df["period_end"])
+
+    amount_col = detect_amount_column(df)
+    df[amount_col] = coerce_numeric(df[amount_col])
+    print("Detected amount column:", amount_col)
+
+    df = ensure_period_month(df)
+
+    findings: List[Finding] = []
+
+    if statement_type == "summary":
+        findings += check_negative_amounts(df, amount_col)
+        findings += check_duplicates_summary(df, amount_col)
+        findings += check_suspicious_territories(df)
+        findings += check_missing_periods(df)
+        findings += check_platform_revenue_outliers(df, amount_col)
+        findings += check_revenue_concentration(df, amount_col)
+        findings += check_missing_expected_platforms(df, amount_col)
+
+    elif statement_type == "line_item":
+        findings += check_missing_line_item_ids(df)
+        findings += check_negative_amounts(df, amount_col)
+        findings += check_zero_or_blank_amounts(df, amount_col)
+        findings += check_rate_math(df, amount_col)
+
+    else:
+        findings.append(
+            Finding(
+                id=stable_id("ambiguous_statement"),
+                category="Statement type unclear",
+                severity="Low",
+                confidence=0.6,
+                summary="This file does not clearly match a summary or line-item royalty statement format.",
+                recommended_action="Export a detailed (line-item) royalty report if available, ideally including track/ISRC and earnings columns.",
+                evidence=[],
+            )
+        )
+
+    total_rows = int(len(df))
+    total_amount = float(df[amount_col].fillna(0).sum())
+
+    coverage_overview = build_royalty_stream_coverage(df, statement_type)
+    estimated_contextual_ranges = build_contextual_range_estimates(total_amount)
+    prioritized_opportunities = build_prioritized_opportunities(estimated_contextual_ranges)
+
+    top_revenue_drivers: List[Dict[str, Any]] = []
+    if statement_type == "line_item":
+        top_revenue_drivers = build_top_revenue_drivers(df, amount_col, top_n=10)
+
+    trend_intelligence = compute_trend_intelligence(df, amount_col) or {"window_months": 0, "signals": []}
+    revenue_risk_level = compute_revenue_risk_level(trend_intelligence or {})
+
+    disclosures = [
+        "Coverage Overview indicates which royalty streams are represented in the uploaded dataset vs. commonly reported elsewhere.",
+        "Estimated Contextual Ranges are provided for prioritization only and do not represent statements of entitlement, unpaid royalties, or guarantees of recovery.",
+        "Actual results depend on ownership, splits, registrations, reporting timelines, territory, and statement type (summary vs line-item).",
+    ]
+
+    report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "input": load_meta,
+        "summary": {
+            "statement_type": statement_type,
+            "total_rows": total_rows,
+            "amount_column": amount_col,
+            "total_amount": total_amount,
+            "findings_count": len(findings),
+            "top_categories": (
+                pd.Series([f.category for f in findings]).value_counts().to_dict()
+                if findings else {}
+            ),
+        },
+        "trend_intelligence": trend_intelligence,
+        "revenue_risk_level": revenue_risk_level,
+        "coverage_overview": coverage_overview,
+        "estimated_contextual_ranges": estimated_contextual_ranges,
+        "prioritized_opportunities": prioritized_opportunities,
+        "top_revenue_drivers": top_revenue_drivers,
+        "disclosures": disclosures,
+        "findings": [asdict(f) for f in findings],
+    }
+
+    # keep your existing composite exposure score
+    report["financial_exposure"] = compute_financial_exposure(report)
+
+    return report
+
+
+def analyze_file(input_path: str, mode: str = "both") -> Dict[str, Any]:
+    """
+    mode:
+      - "portfolio"  => one combined report (all rows)
+      - "per_artist" => one report per sheet/artist_key (returns a bundle)
+      - "both"       => portfolio + per-artist bundle
+    """
+    df, load_meta = load_statement_file(input_path)
+
+    sheet_count = int(load_meta.get("sheet_count", 0) or 0)
+
+    # Not a workbook (or only 1 sheet) -> normal single report
+    if sheet_count <= 1:
+        return analyze_dataframe(df, load_meta)
+
+    # Workbook bundle
+    results: Dict[str, Any] = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "input": load_meta,
+        "mode": mode,
+    }
+
+    # Portfolio report (all sheets combined)
+    if mode in {"portfolio", "both"}:
+        portfolio_meta = dict(load_meta)
+        portfolio_meta["report_scope"] = "portfolio_all_sheets"
+        results["portfolio_report"] = analyze_dataframe(df.copy(), portfolio_meta)
+
+    # Per-artist reports (best split: sheet column you already have)
+    if mode in {"per_artist", "both"}:
+        per_artist = []
+        split_col = "_source_sheet" if "_source_sheet" in df.columns else "artist_name"
+
+        for key, sub in df.groupby(split_col):
+            sub = sub.copy()
+            artist_meta = dict(load_meta)
+            artist_meta["report_scope"] = "single_artist"
+            artist_meta["artist_key"] = str(key)
+            artist_meta["sheet"] = str(key) if split_col == "_source_sheet" else artist_meta.get("sheet")
+
+            per_artist.append({
+                "artist_key": str(key),
+                "report": analyze_dataframe(sub, artist_meta),
+            })
+
+        results["artist_reports"] = per_artist
+
+    return results
+
+
+def write_report_json(report: Dict[str, Any], out_path: str) -> None:
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2, default=str)
+
+
+# ============================================================
+# EXECUTIVE DOCX REPORT GENERATOR
+# ============================================================
+
+def build_risk_summary(report: Dict[str, Any]) -> str:
+    findings = report.get("findings", []) or []
+
+    rr = report.get("revenue_risk_level", {}) or {}
+    level = (rr.get("revenue_risk_level") or "").strip()
+
+    if not findings:
+        if level in {"High", "Moderate"}:
+            return (
+                "No major reporting irregularities were detected in this upload, "
+                "but revenue behavior signals indicate elevated risk."
+            )
+        return "No major reporting irregularities were detected in this upload."
+
+    cats = []
+    for f in findings:
+        if (f.get("severity") == "High") and (f.get("category") in {
+            "Revenue concentration",
+            "Coverage gap risk",
+            "Territory concentration risk",
+            "Missing reporting periods",
+            "Platform revenue anomalies",
+        }):
+            cats.append(f.get("category"))
+
+    cats = list(dict.fromkeys([c for c in cats if c]))
+    if not cats:
+        return "No major reporting irregularities were detected in this upload."
+
+    mapping = {
+        "Revenue concentration": "High concentration",
+        "Coverage gap risk": "Possible missing platform coverage",
+        "Territory concentration risk": "Possible missing territory scope",
+        "Missing reporting periods": "Missing reporting periods",
+        "Platform revenue anomalies": "Platform revenue anomalies",
+    }
+
+    labels = [mapping.get(c, c) for c in cats]
+    return "Risk Summary: " + "; ".join(labels) + "."
+
+
+def generate_executive_docx(report: Dict[str, Any]) -> str:
+    doc = Document()
+
+    normal = doc.styles["Normal"]
+    normal.font.name = "Calibri"
+    normal.font.size = Pt(11)
+
+    doc.styles["Heading 1"].font.name = "Calibri"
+    doc.styles["Heading 1"].font.size = Pt(22)
+    doc.styles["Heading 2"].font.name = "Calibri"
+    doc.styles["Heading 2"].font.size = Pt(14)
+    doc.styles["Heading 3"].font.name = "Calibri"
+    doc.styles["Heading 3"].font.size = Pt(12)
+
+    def set_cell_shading(cell, fill="F3F4F6"):
+        tcPr = cell._tc.get_or_add_tcPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:color"), "auto")
+        shd.set(qn("w:fill"), fill)
+        tcPr.append(shd)
+
+    def bold_cell(cell, size=10):
+        for p in cell.paragraphs:
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(size)
+
+    def style_table(table, header_fill="E3E7EE", zebra=True):
+        table.style = "Table Grid"
+        table.allow_autofit = True
+
+        hdr_cells = table.rows[0].cells
+        for c in hdr_cells:
+            set_cell_shading(c, header_fill)
+            bold_cell(c, size=10)
+
+        for ridx, r in enumerate(table.rows[1:], start=1):
+            for c in r.cells:
+                for p in c.paragraphs:
+                    for run in p.runs:
+                        run.font.size = Pt(10)
+            if zebra and (ridx % 2 == 0):
+                for c in r.cells:
+                    set_cell_shading(c, "F6F7F9")
+
+    def add_divider():
+        p = doc.add_paragraph("—" * 28)
+        p.paragraph_format.space_before = Pt(6)
+        p.paragraph_format.space_after = Pt(10)
+
+    local_now = datetime.now()
+    display_date = local_now.strftime("%B %d, %Y")
+    filename_date = local_now.strftime("%Y-%m")
+
+    source_path = report.get("input", {}).get("source_path", "") or ""
+    artist_name = source_path.split(".")[0] if source_path else "Unknown_Artist"
+    filename = f"RI_Report_{artist_name}_{filename_date}.docx"
+
+    title = doc.add_heading("Royalty Intelligence", level=1)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    sub = doc.add_paragraph(artist_name)
+    sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    date_para = doc.add_paragraph(f"Report Date: {display_date}")
+    date_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_paragraph("")
+
+    # ---------- EXECUTIVE OVERVIEW ----------
+    h = doc.add_heading("Executive Overview", level=2)
+    h.paragraph_format.keep_with_next = False
+    h.paragraph_format.keep_together = False
+
+    total_amount = float(report.get("summary", {}).get("total_amount", 0.0) or 0.0)
+    statement_type = report.get("summary", {}).get("statement_type", "Unknown")
+
+    overview_text = (
+        "This report reviews the uploaded royalty statement and provides structural analysis, "
+        "coverage mapping, and contextual prioritization insights. "
+        f"The upload appears to be a {statement_type}-level export reflecting "
+        f"${total_amount:,.2f} in reported revenue. "
+        "Where applicable, adjacent royalty streams may warrant review depending on ownership structure, splits, "
+        "and registrations."
+    )
+    p = doc.add_paragraph(overview_text)
+    p.paragraph_format.space_after = Pt(6)
+
+    risk_line = build_risk_summary(report)
+    rp = doc.add_paragraph(risk_line)
+    rp.runs[0].bold = True
+    rp.paragraph_format.space_after = Pt(6)
+
+    rr = report.get("revenue_risk_level", {}) or {}
+    level = rr.get("revenue_risk_level")
+    meaning = rr.get("meaning")
+    start = rr.get("recommended_start")
+
+    if level and meaning and start:
+        p = doc.add_paragraph()
+        r1 = p.add_run("Revenue Risk Level:")
+        r1.bold = True
+        p.add_run(f" {level}")
+
+        p = doc.add_paragraph()
+        r2 = p.add_run("Meaning:")
+        r2.bold = True
+        p.add_run(f" {meaning}")
+
+        p = doc.add_paragraph()
+        r3 = p.add_run("Start with:")
+        r3.bold = True
+        p.add_run(f" {start}")
+        doc.add_paragraph("")
+
+    add_divider()
+
+    # ---------- START HERE: WHERE TO LOOK FIRST ----------
+    h = doc.add_heading("Start Here: Where to Look First", level=2)
+    h.paragraph_format.keep_with_next = False
+    h.paragraph_format.keep_together = False
+
+    range_map = {}
+    for r in report.get("estimated_contextual_ranges", []):
+        stream = r.get("stream", "")
+        low = float(r.get("estimated_range_usd", {}).get("low", 0.0) or 0.0)
+        high = float(r.get("estimated_range_usd", {}).get("high", 0.0) or 0.0)
+        range_map[stream] = {
+            "range": f"${low:,.0f} – ${high:,.0f}",
+            "confidence": r.get("confidence", "Unknown"),
+        }
+
+    top = (report.get("prioritized_opportunities", []) or [])[:3]
+
+    callout = doc.add_table(rows=1, cols=1)
+    callout.allow_autofit = True
+    callout.style = "Table Grid"
+    cell = callout.rows[0].cells[0]
+    set_cell_shading(cell, "F2F7FF")
+    cell.paragraphs[0].text = ""
+
+    if top:
+        for i, opp in enumerate(top, start=1):
+            stream = opp.get("stream", "Unknown Stream")
+            rinfo = range_map.get(stream, {"range": "N/A", "confidence": "Unknown"})
+            text = f"{i}. {stream} — Est. {rinfo['range']} (Confidence: {rinfo['confidence']})"
+            pp = cell.add_paragraph(text)
+            if pp.runs:
+                pp.runs[0].bold = True
+            pp.paragraph_format.left_indent = Pt(18)
+            pp.paragraph_format.first_line_indent = Pt(-18)
+            pp.paragraph_format.space_after = Pt(2)
+
+        p2 = cell.add_paragraph(
+            "Suggested next step: confirm registrations and reporting coverage for the top item(s), "
+            "then request the most detailed line-item export available to validate drivers by track/territory."
+        )
+        p2.paragraph_format.space_before = Pt(6)
+    else:
+        p2 = cell.add_paragraph(
+            "Suggested next step: upload a more detailed export (ideally line-item with track/ISRC and earnings), "
+            "then re-run this report for deeper validation."
+        )
+        p2.paragraph_format.space_before = Pt(6)
+
+    p = doc.add_paragraph()
+    run1 = p.add_run("Tip:")
+    run1.bold = True
+    p.add_run(
+        " Start with the top item above, confirm registrations + reporting sources, then request line-item exports to validate drivers.")
+    p.paragraph_format.space_before = Pt(4)
+    p.paragraph_format.space_after = Pt(0)
+
+    add_divider()
+
+    drivers = report.get("top_revenue_drivers", []) or []
+    if drivers:
+        h = doc.add_heading("Top Revenue Drivers (From This Upload)", level=2)
+        h.paragraph_format.keep_with_next = False
+        h.paragraph_format.keep_together = False
+
+        total_upload = sum(float(d.get("amount_usd", 0.0)) for d in drivers)
+        top3 = drivers[:3]
+        top3_total = sum(float(d.get("amount_usd", 0.0)) for d in top3)
+
+        if total_upload > 0:
+            pct = (top3_total / total_upload) * 100
+            insight = (
+                f"The top {len(top3)} track(s) represent approximately "
+                f"{pct:.1f}% of reported revenue in this upload. "
+                "If adjacent royalty streams exist (mechanical, performance, neighboring rights), "
+                "these works should be prioritized for registration and verification first."
+            )
+            ip = doc.add_paragraph(insight)
+            ip.paragraph_format.space_after = Pt(6)
+
+        table = doc.add_table(rows=1, cols=4)
+        style_table(table)
+        hdr = table.rows[0].cells
+        hdr[0].text = "Track Title"
+        hdr[1].text = "Platform"
+        hdr[2].text = "Territory"
+        hdr[3].text = "Amount (USD)"
+
+        for d in drivers:
+            row = table.add_row().cells
+            row[0].text = str(d.get("track_title", ""))[:60]
+            row[1].text = str(d.get("platform_org", ""))[:30]
+            row[2].text = str(d.get("territory", ""))[:20]
+            row[3].text = f"${float(d.get('amount_usd', 0.0)):,.2f}"
+
+        note = doc.add_paragraph()
+        run1 = note.add_run("Note:")
+        run1.bold = True
+        note.add_run(
+            " These are the highest-earning items inside the uploaded file only. "
+            "If this export is partial (single platform/territory), drivers may shift once full coverage is uploaded."
+        )
+        note.paragraph_format.space_before = Pt(4)
+        note.paragraph_format.space_after = Pt(0)
+
+    # ---------- ESTIMATED OPPORTUNITY REVIEW ----------#
+    h = doc.add_heading("Estimated Opportunity Review", level=2)
+    h.paragraph_format.keep_with_next = False
+    h.paragraph_format.keep_together = False
+
+    ranges = report.get("estimated_contextual_ranges", []) or []
+    priorities = report.get("prioritized_opportunities", []) or []
+    priority_map = {p.get("stream"): p.get("priority_rank") for p in priorities if p.get("stream")}
+
+    table = doc.add_table(rows=1, cols=4)
+    style_table(table)
+    table.columns[0].width = Inches(1.0)
+    table.columns[1].width = Inches(2.8)
+    table.columns[2].width = Inches(1.6)
+    table.columns[3].width = Inches(1.1)
+
+    hdr = table.rows[0].cells
+    hdr[0].text = "Priority"
+    hdr[1].text = "Revenue Stream"
+    hdr[2].text = "Estimated Range (USD)"
+    hdr[3].text = "Confidence"
+
+    for item in ranges:
+        stream = item.get("stream", "Unknown Stream")
+        low = float(item.get("estimated_range_usd", {}).get("low", 0.0) or 0.0)
+        high = float(item.get("estimated_range_usd", {}).get("high", 0.0) or 0.0)
+
+        rank = priority_map.get(stream)
+        if rank == 1:
+            priority_label = "High"
+        elif rank == 2:
+            priority_label = "Medium"
+        else:
+            priority_label = "Low"
+
+        row = table.add_row().cells
+        row[0].text = priority_label
+        row[1].text = stream
+        row[2].text = f"${low:,.0f} – ${high:,.0f}"
+        row[3].text = item.get("confidence", "Unknown")
+
+    add_divider()
+
+    # ---------- TREND INTELLIGENCE ----------#
+    trend = report.get("trend_intelligence", {}) or {}
+    signals = trend.get("signals", []) or []
+
+    if signals:
+        h = doc.add_heading("Trend Intelligence (Cross-Period)", level=2)
+        h.paragraph_format.keep_with_next = False
+        h.paragraph_format.keep_together = False
+
+        # ---------- Window (show once) ----------
+        window = trend.get("window_label") or trend.get("window")
+        if window:
+            p = doc.add_paragraph()
+            r = p.add_run("Window:")
+            r.bold = True
+            p.add_run(f" {window}")
+            doc.add_paragraph("")
+
+        # Friendly names (so non-technical readers get it)
+        FRIENDLY = {
+            "PORTFOLIO_BEHAVIOR": "Portfolio Behavior",
+            "REVENUE_TRAJECTORY": "Revenue Trajectory",
+            "TERRITORY_DISAPPEARANCE": "Territory Disappearance",
+        }
+
+        # Normalize + prioritize (best UX flow)
+        ORDER = ["PORTFOLIO_BEHAVIOR", "REVENUE_TRAJECTORY", "TERRITORY_DISAPPEARANCE"]
+
+        grouped = {}
+        for s in signals:
+            grouped.setdefault(s.get("signal_type", "OTHER"), []).append(s)
+
+        # Render in the order we want
+        ordered_types = [t for t in ORDER if t in grouped] + [t for t in grouped.keys() if t not in ORDER]
+
+        for sig_type in ordered_types:
+            items = grouped.get(sig_type, [])
+            title = FRIENDLY.get(sig_type, sig_type.replace("_", " ").title())
+
+            sh = doc.add_paragraph()
+            r = sh.add_run(f"{title}:")
+            r.bold = True
+
+            for s in items:
+                summary = (s.get("summary") or "").strip()
+                sev = s.get("severity", "Unknown")
+                conf = s.get("confidence", "Unknown")
+                rec = (s.get("recommended_action") or "").strip()
+
+                sev = "Medium" if sev in {"Med", "Medium"} else sev
+                conf = "Medium" if conf in {"Med", "Medium"} else conf
+
+                # Main bullet
+                p1 = doc.add_paragraph(f"• {summary}")
+
+                # Severity / Confidence line
+                p2 = doc.add_paragraph(f"(Impact: {sev} | Certainty: {conf})")
+
+                # NEW: Start here line
+                if rec:
+                    p3 = doc.add_paragraph()
+                    r = p3.add_run("Start here:")
+                    r.bold = True
+                    p3.add_run(f" {rec}")
+
+                doc.add_paragraph("")
+
+        # ---------- How to use this (bold prefix before colon) ----------
+        p = doc.add_paragraph()
+        r = p.add_run("How to use this:")
+        r.bold = True
+        p.add_run(
+            " Treat these as investigation triggers. Prioritize validating reporting completeness, "
+            "confirming territory coverage, and reconciling any recent distribution or rights changes."
+        )
+
+        add_divider()
+
+    # ---------- ROYALTY STREAM COVERAGE ----------#
+    h = doc.add_heading("Royalty Stream Coverage", level=2)
+    h.paragraph_format.keep_with_next = False
+    h.paragraph_format.keep_together = False
+
+    coverage = report.get("coverage_overview", []) or []
+    table = doc.add_table(rows=1, cols=2)
+    style_table(table)
+    table.columns[0].width = Inches(5.0)
+    table.columns[1].width = Inches(1.0)
+
+    hdr = table.rows[0].cells
+    hdr[0].text = "Revenue Stream"
+    hdr[1].text = "Represented"
+
+    for item in coverage:
+        represented = item.get("represented_in_upload")
+        if represented is True:
+            rep_text = "Yes"
+        elif represented is False:
+            rep_text = "No"
+        else:
+            rep_text = "Unknown"
+
+        row = table.add_row().cells
+        row[0].text = str(item.get("stream", ""))
+        row[1].text = rep_text
+
+    add_divider()
+
+    h = doc.add_heading("Key Insights", level=2)
+    h.paragraph_format.keep_with_next = False
+    h.paragraph_format.keep_together = False
+
+    doc.add_paragraph(
+        "This upload reflects only the revenue present in the provided export. "
+        "If composition or neighboring rights collections are expected, validating registrations and reporting sources "
+        "may provide additional clarity. Concentration signals can help prioritize where deeper audit work is most likely to pay off."
+    )
+
+    findings = report.get("findings", []) or []
+    if not findings:
+        doc.add_paragraph("• No anomalies were detected by the current rule set for this upload.")
+    else:
+        platform_msgs, territory_msgs, other_msgs = [], [], []
+        for f in findings:
+            cat = (f.get("category", "") or "").strip()
+            summ = (f.get("summary", "") or "").strip()
+            if cat in {"Revenue concentration", "Coverage gap risk"}:
+                platform_msgs.append(summ)
+            elif cat in {"Territory concentration risk"}:
+                territory_msgs.append(summ)
+            else:
+                other_msgs.append(summ)
+
+        if platform_msgs:
+            combined = " ".join(dict.fromkeys(platform_msgs))
+            pp = doc.add_paragraph(f"• Platform coverage: {combined}")
+            pp.paragraph_format.space_after = Pt(2)
+
+        if territory_msgs:
+            combined = " ".join(dict.fromkeys([m for m in territory_msgs if m]))
+            pp = doc.add_paragraph(f"• Territory scope: {combined}")
+            pp.paragraph_format.space_after = Pt(2)
+
+        for msg in dict.fromkeys([m for m in other_msgs if m]):
+            pp = doc.add_paragraph(f"• {msg}")
+            pp.paragraph_format.space_after = Pt(2)
+
+    add_divider()
+
+    h = doc.add_heading("Disclosures", level=3)
+    h.paragraph_format.keep_with_next = False
+    h.paragraph_format.keep_together = False
+
+    for d in report.get("disclosures", []) or []:
+        pp = doc.add_paragraph(d)
+        pp.paragraph_format.space_after = Pt(2)
+
+    doc.save(filename)
+    return filename
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+    input_path = "We The Best Clients.xlsx"
+    out_path = "royalty_intelligence_report.json"
+
+    report = analyze_file(input_path)
+
+    # --- Pick the correct report object for single-report functions (DOCX/summary/prints) ---
+    if isinstance(report, dict) and "portfolio_report" in report:
+        main_report = report["portfolio_report"]
+        artist_count = len(report.get("artist_reports", []))
+        print(f"Workbook mode: {artist_count} artist tabs analyzed")
+    else:
+        main_report = report
+
+    # --- Generate DOCX from the main report ---
+    docx_filename = generate_executive_docx(main_report)
+    print(f"DOCX Report Generated: {docx_filename}")
+
+    # --- Write JSON (write the full bundle if present) ---
+    write_report_json(report, out_path)
+    print(f"Wrote: {out_path}")
+
+    # --- Print summary safely ---
+    print(f"Findings: {main_report.get('summary', {}).get('findings_count', 0)}")
+
+    # --- Optional: quick signal debug ---
+    trend = main_report.get("trend_intelligence", {}) or {}
+    signals = trend.get("signals", []) or []
+    print(f"Trend signals: {len(signals)}")
+
+    # --- Metadata print (safe for both modes) ---
+    print("Loaded file metadata:", report.get("input", {}))
