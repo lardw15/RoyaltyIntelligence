@@ -70,6 +70,34 @@ def _try_read_text_table(data: bytes, sep: Optional[str] = None) -> pd.DataFrame
             last_err = e
     raise ValueError(f"Could not read as text table with common encodings. Last error: {last_err}")
 
+def detect_header_row(df: pd.DataFrame, max_scan_rows: int = 10) -> int:
+    """
+    Detect likely header row by scoring rows based on:
+    - number of non-empty cells
+    - presence of typical header-like strings
+    """
+    header_keywords = {
+        "amount", "revenue", "royalty", "earnings",
+        "platform", "service", "territory", "country",
+        "isrc", "track", "title", "period", "date",
+        "units", "streams"
+    }
+
+    best_row = 0
+    best_score = -1
+
+    for i in range(min(max_scan_rows, len(df))):
+        row = df.iloc[i].astype(str).str.lower()
+        non_empty = row[row.str.strip() != ""]
+        keyword_hits = sum(any(k in cell for k in header_keywords) for cell in row)
+
+        score = len(non_empty) + (keyword_hits * 2)
+
+        if score > best_score:
+            best_score = score
+            best_row = i
+
+    return best_row
 
 def _read_excel_all_sheets(excel_file: Any) -> Tuple[pd.DataFrame, List[str]]:
     """
@@ -82,7 +110,9 @@ def _read_excel_all_sheets(excel_file: Any) -> Tuple[pd.DataFrame, List[str]]:
     sheet_names = list(xls.sheet_names)
 
     for sheet in sheet_names:
-        df = pd.read_excel(xls, sheet_name=sheet, dtype=str, na_filter=False)
+        raw = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=str, na_filter=False)
+        header_row = detect_header_row(raw)
+        df = pd.read_excel(xls, sheet_name=sheet, header=header_row, dtype=str, na_filter=False)
         if df is None or df.empty:
             continue
         df["sheet_name"] = sheet
@@ -93,6 +123,76 @@ def _read_excel_all_sheets(excel_file: Any) -> Tuple[pd.DataFrame, List[str]]:
 
     return pd.concat(frames, ignore_index=True), sheet_names
 
+def _read_excel_as_units(excel_file: Any, source_meta: dict) -> List[dict]:
+    """
+    Read each sheet as a separate unit: [{"df":..., "meta":...}, ...]
+    """
+    xls = pd.ExcelFile(excel_file)
+    units: List[dict] = []
+
+    for sheet in xls.sheet_names:
+        # read raw for header detection
+        raw = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=str, na_filter=False)
+        header_row = detect_header_row(raw)
+
+        df = pd.read_excel(xls, sheet_name=sheet, header=header_row, dtype=str, na_filter=False)
+        if df is None or df.empty:
+            continue
+
+        df = _normalize_columns(df)
+        df["_source_sheet"] = sheet
+
+        meta = dict(source_meta)
+        meta["loaded_as"] = "excel_sheet_unit"
+        meta["sheet"] = sheet
+
+        units.append({"df": df, "meta": meta})
+
+    return units
+
+def _read_excel_bytes_as_units(excel_bytes: bytes, source_meta: dict) -> List[dict]:
+    """
+    Read an in-memory Excel file (bytes) as separate sheet units.
+    Forces an engine so pandas can open BytesIO.
+    """
+    bio = io.BytesIO(excel_bytes)
+
+    zip_member = (source_meta or {}).get("zip_member", "")
+    ext = Path(zip_member).suffix.lower()
+
+    # xlsx => openpyxl, xls => xlrd (if installed) or fallback to openpyxl where possible
+    if ext == ".xlsx":
+        xls = pd.ExcelFile(bio, engine="openpyxl")
+    elif ext == ".xls":
+        # xlrd support depends on environment; try xlrd first, then openpyxl
+        try:
+            xls = pd.ExcelFile(bio, engine="xlrd")
+        except Exception:
+            xls = pd.ExcelFile(bio, engine="openpyxl")
+    else:
+        # default safest engine for modern Excel
+        xls = pd.ExcelFile(bio, engine="openpyxl")
+
+    # Now read sheets similarly to _read_excel_as_units, but using `xls` we already opened
+    units: List[dict] = []
+    for sheet in xls.sheet_names:
+        raw = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=str, na_filter=False)
+        header_row = detect_header_row(raw)
+
+        df = pd.read_excel(xls, sheet_name=sheet, header=header_row, dtype=str, na_filter=False)
+        if df is None or df.empty:
+            continue
+
+        df = _normalize_columns(df)
+        df["_source_sheet"] = sheet
+
+        meta = dict(source_meta)
+        meta["loaded_as"] = "zip_excel_sheet_unit"
+        meta["sheet"] = sheet
+
+        units.append({"df": df, "meta": meta})
+
+    return units
 
 def load_statement_file(path_str: str) -> Tuple[pd.DataFrame, dict]:
     """
@@ -177,6 +277,101 @@ def load_statement_file(path_str: str) -> Tuple[pd.DataFrame, dict]:
         f"Unsupported file type: {ext}. Supported: {sorted(TEXT_EXTS | EXCEL_EXTS | ZIP_EXTS)}"
     )
 
+def load_statement_package(path_str: str) -> Dict[str, Any]:
+    """
+    Loads a file into a package:
+      {
+        "package_meta": {...},
+        "units": [{"df":..., "meta":...}, ...]
+      }
+    """
+    path = Path(path_str)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    ext = path.suffix.lower()
+    package_meta = {"source_path": str(path), "source_type": ext}
+    units: List[dict] = []
+
+    # Excel => one unit per sheet
+    if ext in EXCEL_EXTS:
+        source_meta = dict(package_meta)
+        units = _read_excel_as_units(path, source_meta)
+        package_meta["unit_count"] = len(units)
+        package_meta["sheets"] = [u["meta"]["sheet"] for u in units]
+        return {"package_meta": package_meta, "units": units}
+
+    # Text => single unit
+    if ext in TEXT_EXTS:
+        data = path.read_bytes()
+        sep = "\t" if ext == ".tsv" else None
+        df = _try_read_text_table(data, sep=sep)
+        df = _normalize_columns(df)
+        units.append({"df": df, "meta": {**package_meta, "loaded_as": "delimited_text"}})
+        package_meta["unit_count"] = 1
+        return {"package_meta": package_meta, "units": units}
+
+    # ZIP => Stage 3 (we’ll keep “first file” behavior for now)
+    if ext in ZIP_EXTS:
+        with zipfile.ZipFile(path, "r") as z:
+            members = [m for m in z.namelist() if not m.endswith("/")]
+
+            # ✅ FILTER OUT macOS ARTIFACTS
+            members = [
+                m for m in members
+                if not m.startswith("__MACOSX/")
+                   and "/__MACOSX/" not in m
+                   and not Path(m).name.startswith("._")
+            ]
+
+            supported = [
+                m for m in members
+                if Path(m).suffix.lower() in (TEXT_EXTS | EXCEL_EXTS)
+            ]
+
+            if not supported:
+                raise ValueError("ZIP contained no supported files (.csv/.tsv/.txt/.xlsx/.xls).")
+
+            for member in supported:
+                inner_ext = Path(member).suffix.lower()
+                data = z.read(member)
+
+                base_meta = dict(package_meta)
+                base_meta["zip_member"] = member
+                base_meta["source_type"] = inner_ext
+
+                # ✅ Excel members
+                if inner_ext in EXCEL_EXTS:
+                    try:
+                        excel_units = _read_excel_bytes_as_units(data, base_meta)
+                        units.extend(excel_units)
+                    except Exception as e:
+                        package_meta.setdefault("skipped_members", []).append({
+                            "zip_member": member,
+                            "reason": f"{type(e).__name__}: {e}",
+                        })
+                    continue
+
+                # ✅ Text members
+                try:
+                    sep = "\t" if inner_ext == ".tsv" else None
+                    df = _try_read_text_table(data, sep=sep)
+                    df = _normalize_columns(df)
+
+                    meta = dict(base_meta)
+                    meta["loaded_as"] = "zip_delimited_text_unit"
+                    units.append({"df": df, "meta": meta})
+                except Exception as e:
+                    package_meta.setdefault("skipped_members", []).append({
+                        "zip_member": member,
+                        "reason": f"{type(e).__name__}: {e}",
+                    })
+
+        package_meta["unit_count"] = len(units)
+        package_meta["zip_members_loaded"] = supported
+        return {"package_meta": package_meta, "units": units}
+
+    raise ValueError(f"Unsupported file type: {ext}")
 
 # ============================================================
 # STEP 2: FINDING SCHEMA + HELPERS
@@ -614,6 +809,126 @@ def detect_statement_type(df: pd.DataFrame) -> StatementType:
 
     return "ambiguous"
 
+StatementFamily = Literal[
+    "DISTRIBUTOR_LABEL_MASTER",
+    "MLC_MECHANICAL",
+    "PRO_PERFORMANCE",
+    "NEIGHBORING_RIGHTS",
+    "UGC_CONTENT_ID",
+    "PUBLISHING_ADMIN",
+    "UNKNOWN",
+]
+
+def classify_statement_family(df: pd.DataFrame, meta: dict) -> Dict[str, Any]:
+    """
+    Heuristic classifier using:
+    - zip_member / sheet naming hints
+    - column signals
+    - source_type / platform_org signals
+    Returns {"family": ..., "confidence": 0..1, "reasons": [...]}
+    """
+    cols = set([c.lower() for c in df.columns])
+    reasons: List[str] = []
+
+    # ---- Name-based hints (very strong in real packages) ----
+    name_parts = []
+    if meta:
+        for k in ["zip_member", "sheet", "source_path"]:
+            v = meta.get(k)
+            if v:
+                name_parts.append(str(v).lower())
+    name_blob = " ".join(name_parts)
+
+    def has_name(*terms: str) -> bool:
+        return any(t.lower() in name_blob for t in terms)
+
+    # MLC
+    if has_name("mlc", "mechanical licensing collective"):
+        return {"family": "MLC_MECHANICAL", "confidence": 0.9, "reasons": ["Name hint: MLC/mechanical"]}
+
+    # PRO
+    if has_name("ascap", "bmi", "sesac", "prs", "sacem", "gema", "apra", "socan", "pro"):
+        return {"family": "PRO_PERFORMANCE", "confidence": 0.9, "reasons": ["Name hint: PRO society"]}
+
+    # Neighboring rights
+    if has_name("soundexchange", "ppl", "gvl", "sppf", "neighboring", "neighbouring"):
+        return {"family": "NEIGHBORING_RIGHTS", "confidence": 0.9, "reasons": ["Name hint: neighboring rights society"]}
+
+    # UGC / Content ID
+    if has_name("content id", "contentid", "ugc", "youtube", "meta", "facebook", "instagram", "tiktok"):
+        # Still check columns too, but name is strong enough to label
+        reasons.append("Name hint: UGC/Content ID platforms")
+
+    # Publishing admin
+    if has_name("publishing", "publisher", "admin", "subpub", "royaltyshare", "songtrust", "sentric", "kobalt"):
+        reasons.append("Name hint: publishing admin")
+
+    # ---- Column-based signals ----
+    # MLC mechanical tends to include "work" identifiers: iswc, writer, publisher, share, mechanical
+    mlc_signals = {"iswc", "work_title", "writer", "publisher", "mechanical", "usage_type", "mechanicals"}
+    pro_signals = {"performance", "cue", "program", "episode", "pro", "broadcast", "station", "venue"}
+    nr_signals = {"neighboring", "neighbouring", "soundexchange", "ppl", "featured_artist", "nonfeatured", "performer"}
+    ugc_signals = {"content_id", "asset_id", "video_id", "channel", "claim", "monetized_playbacks"}
+    dist_signals = {"platform_org", "dsp", "store", "service", "spotify", "apple", "amazon", "youtube_music", "tidal"}
+
+    # Helper: count signal hits
+    def hit_count(sig: set[str]) -> int:
+        return len(cols.intersection(sig))
+
+    mlc_hits = hit_count(mlc_signals)
+    pro_hits = hit_count(pro_signals)
+    nr_hits = hit_count(nr_signals)
+    ugc_hits = hit_count(ugc_signals)
+    dist_hits = hit_count(dist_signals)
+
+    # UGC override if explicit IDs present
+    if ugc_hits >= 1 and ("asset_id" in cols or "content_id" in cols or "video_id" in cols):
+        return {"family": "UGC_CONTENT_ID", "confidence": 0.75, "reasons": reasons + ["Columns: Content ID / asset signals"]}
+
+    # MLC
+    if mlc_hits >= 2:
+        return {"family": "MLC_MECHANICAL", "confidence": 0.75, "reasons": reasons + [f"Columns: mechanical/work signals ({mlc_hits})"]}
+
+    # PRO
+    if pro_hits >= 2:
+        return {"family": "PRO_PERFORMANCE", "confidence": 0.7, "reasons": reasons + [f"Columns: performance signals ({pro_hits})"]}
+
+    # Neighboring rights
+    if nr_hits >= 2:
+        return {"family": "NEIGHBORING_RIGHTS", "confidence": 0.7, "reasons": reasons + [f"Columns: neighboring rights signals ({nr_hits})"]}
+
+    # Publishing admin (weaker; often looks like line_item but not DSP)
+    if ("publisher" in cols or "writer" in cols) and dist_hits == 0:
+        return {"family": "PUBLISHING_ADMIN", "confidence": 0.6, "reasons": reasons + ["Columns: publisher/writer with no DSP signals"]}
+
+    # Distributor/Label: DSP/service/platform present OR your normalized schema is clearly DSP-based
+    # Distributor/Label (master) — broader summary fallback
+    summary_like = (
+            ("amount" in cols) and
+            (("period_start" in cols) or ("period_end" in cols) or ("period" in cols)) and
+            ("territory" in cols)
+    )
+
+    if ("platform_org" in cols) or (dist_hits >= 1):
+        return {"family": "DISTRIBUTOR_LABEL_MASTER", "confidence": 0.65,
+                "reasons": reasons + ["Columns: DSP/platform signals"]}
+
+    # ✅ NEW: if it's summary-like and has common distributor statement fields, classify as distributor/label
+    if summary_like and ("source_type" in cols or "tier" in cols):
+        return {
+            "family": "DISTRIBUTOR_LABEL_MASTER",
+            "confidence": 0.6,
+            "reasons": reasons + ["Columns: summary-like statement (amount/period/territory)"]
+        }
+
+    # Name-hint fallback for UGC/publishing if flagged earlier
+    if any("ugc/content" in r.lower() for r in reasons):
+        return {"family": "UGC_CONTENT_ID", "confidence": 0.55, "reasons": reasons}
+
+    if any("publishing" in r.lower() for r in reasons):
+        return {"family": "PUBLISHING_ADMIN", "confidence": 0.55, "reasons": reasons}
+
+    return {"family": "UNKNOWN", "confidence": 0.4, "reasons": reasons or ["Insufficient signals"]}
 
 def standardize_schema(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -640,7 +955,7 @@ def standardize_schema(df: pd.DataFrame) -> pd.DataFrame:
         "end_date": "period_end",
         "periodend": "period_end",
         "to": "period_end",
-        "statement_date": "period_end",
+        "statement_date": "statement_issue_date",
 
         # Amount / earnings
         "revenue": "amount",
@@ -1247,7 +1562,7 @@ def compute_trend_intelligence(df: pd.DataFrame, amount_col: str) -> Dict[str, A
         "territory_behavior": [],
     }
 
-    if "period_month" not in df.columns:
+    if "period_month" not in df.columns or df["period_month"].isna().all():
         return out
 
     d = df.dropna(subset=["period_month"]).copy()
@@ -1558,11 +1873,13 @@ def compute_financial_exposure(report: Dict[str, Any]) -> Dict[str, Any]:
 # ANALYZE + OUTPUT REPORT
 # ============================================================
 
-def analyze_dataframe(df: pd.DataFrame, load_meta: dict) -> Dict[str, Any]:
+def analyze_dataframe(df: pd.DataFrame, load_meta: dict, verbose: bool = False) -> Dict[str, Any]:
     df = standardize_schema(df)
     statement_type = detect_statement_type(df)
+    family_info = classify_statement_family(df, load_meta)
 
-    print("COLUMNS:", list(df.columns))
+    if verbose:
+        print("COLUMNS:", list(df.columns))
 
     if "period_start" in df.columns:
         df["period_start"] = coerce_date(df["period_start"])
@@ -1571,7 +1888,8 @@ def analyze_dataframe(df: pd.DataFrame, load_meta: dict) -> Dict[str, Any]:
 
     amount_col = detect_amount_column(df)
     df[amount_col] = coerce_numeric(df[amount_col])
-    print("Detected amount column:", amount_col)
+    if verbose:
+        print("Detected amount column:", amount_col)
 
     df = ensure_period_month(df)
 
@@ -1630,6 +1948,8 @@ def analyze_dataframe(df: pd.DataFrame, load_meta: dict) -> Dict[str, Any]:
         "input": load_meta,
         "summary": {
             "statement_type": statement_type,
+            "statement_family": family_info.get("family"),
+            "family_confidence": family_info.get("confidence"),
             "total_rows": total_rows,
             "amount_column": amount_col,
             "total_amount": total_amount,
@@ -1639,6 +1959,7 @@ def analyze_dataframe(df: pd.DataFrame, load_meta: dict) -> Dict[str, Any]:
                 if findings else {}
             ),
         },
+        "statement_family": family_info,
         "trend_intelligence": trend_intelligence,
         "revenue_risk_level": revenue_risk_level,
         "coverage_overview": coverage_overview,
@@ -1654,6 +1975,165 @@ def analyze_dataframe(df: pd.DataFrame, load_meta: dict) -> Dict[str, Any]:
 
     return report
 
+def build_package_coverage_map(unit_reports: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Summarizes which statement families are present across the uploaded package,
+    which are commonly expected but missing, and what to request next.
+    """
+    # Count families
+    fam_counts: Dict[str, int] = {}
+    windows: Dict[str, int] = {}
+
+    for r in unit_reports or []:
+        summ = r.get("summary", {}) or {}
+        fam = summ.get("statement_family") or "UNKNOWN"
+        fam_counts[fam] = fam_counts.get(fam, 0) + 1
+
+        trend = r.get("trend_intelligence", {}) or {}
+        window = trend.get("window_label") or None
+        if window:
+            windows[window] = windows.get(window, 0) + 1
+
+    families_present = {k: v for k, v in fam_counts.items() if k != "UNKNOWN" and v > 0}
+
+    # What a “complete” manager package typically includes
+    expected = [
+        "DISTRIBUTOR_LABEL_MASTER",
+        "MLC_MECHANICAL",
+        "PRO_PERFORMANCE",
+        "NEIGHBORING_RIGHTS",
+    ]
+
+    missing = [f for f in expected if f not in families_present]
+
+    # Recommendation text per missing family
+    rec_map = {
+        "MLC_MECHANICAL": "Upload the MLC mechanical statement/export for the same reporting window (US mechanicals).",
+        "PRO_PERFORMANCE": "Upload PRO distributions (ASCAP/BMI/SESAC/PRS etc.) for the same window (public performance).",
+        "NEIGHBORING_RIGHTS": "Upload neighboring rights statements (SoundExchange/PPL/GVL etc.), especially if radio/digital performance is expected.",
+        "DISTRIBUTOR_LABEL_MASTER": "Upload distributor/label royalty statements (DSP/platform earnings) for the same window.",
+    }
+
+    # Optional: window-aware recommendations
+    window_note = None
+    if windows:
+        # pick the most common window label in the package
+        common_window = sorted(windows.items(), key=lambda x: x[1], reverse=True)[0][0]
+        window_note = f"Most common reporting window in this package: {common_window}"
+
+    recommended_next_uploads = [rec_map[m] for m in missing if m in rec_map]
+
+    notes = []
+    if not families_present:
+        notes.append("No statement families could be confidently classified; consider adding name hints (e.g., 'MLC', 'PRS', 'SoundExchange') to files/tabs.")
+    if window_note:
+        notes.append(window_note)
+
+    return {
+        "families_present": families_present,
+        "missing_families": missing,
+        "recommended_next_uploads": recommended_next_uploads,
+        "notes": notes,
+    }
+
+def build_package_coverage_finding(package_coverage: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Convert package_coverage gaps into a Finding-like dict so it appears in each unit report + DOCX.
+    """
+    coverage = package_coverage or {}
+    missing = coverage.get("missing_families", []) or []
+    recs = coverage.get("recommended_next_uploads", []) or []
+
+    if not missing:
+        return None
+
+    # Severity heuristic
+    if "DISTRIBUTOR_LABEL_MASTER" in missing:
+        severity = "High"
+        confidence = 0.9
+    elif len(missing) >= 3:
+        severity = "High"
+        confidence = 0.85
+    else:
+        severity = "Med"
+        confidence = 0.8
+
+    summary = (
+        "Package coverage gaps detected: missing "
+        + ", ".join(missing)
+        + "."
+    )
+
+    recommended_action = " ".join(recs) if recs else "Upload the missing statement families for the same reporting window."
+
+    finding = {
+        "id": stable_id("package_coverage_gaps", ",".join(missing)),
+        "category": "Package coverage gaps",
+        "severity": severity,
+        "confidence": float(confidence),
+        "summary": summary,
+        "recommended_action": recommended_action,
+        "evidence": [],  # package-level, not row-level
+    }
+    return finding
+
+def analyze_package(input_path: str, verbose: bool = False) -> Dict[str, Any]:
+    pkg = load_statement_package(input_path)
+    package_meta = pkg["package_meta"]
+    units = pkg["units"]
+
+    unit_reports = []
+    for u in units:
+        rep = analyze_dataframe(u["df"], u["meta"], verbose=verbose)
+        unit_reports.append(rep)
+
+    package_coverage = build_package_coverage_map(unit_reports)
+
+    # --- Stage 4C: Inject package coverage gaps into each unit report as a Finding ---
+    pkg_finding = build_package_coverage_finding(package_coverage)
+
+    if pkg_finding:
+        for r in unit_reports:
+            r.setdefault("findings", [])
+            # Put it first so it appears prominently in docs
+            r["findings"].insert(0, pkg_finding)
+
+            # Keep summary counts consistent
+            summ = r.get("summary", {}) or {}
+            summ["findings_count"] = len(r["findings"])
+
+            cats = [f.get("category") for f in r["findings"] if f.get("category")]
+            summ["top_categories"] = pd.Series(cats).value_counts().to_dict() if cats else {}
+            r["summary"] = summ
+
+    for r in unit_reports:
+        r["package_coverage"] = package_coverage
+
+    # Rollup summary
+    rollup = {
+        "unit_count": len(unit_reports),
+        "units": [
+            {
+                "unit_name": (r.get("input", {}) or {}).get("sheet")
+                             or (r.get("input", {}) or {}).get("zip_member")
+                             or Path(((r.get("input", {}) or {}).get("source_path") or "")).name,
+                "statement_type": (r.get("summary", {}) or {}).get("statement_type"),
+                "total_rows": (r.get("summary", {}) or {}).get("total_rows"),
+                "total_amount": (r.get("summary", {}) or {}).get("total_amount"),
+                "findings_count": (r.get("summary", {}) or {}).get("findings_count"),
+                "trend_signals": len(((r.get("trend_intelligence", {}) or {}).get("signals", []) or [])),
+            }
+            for r in unit_reports
+        ],
+    }
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "package_meta": package_meta,
+        "workbook_rollup": rollup,
+        "unit_reports": unit_reports,
+        "package_coverage": package_coverage,
+    }
 
 def analyze_file(input_path: str, mode: str = "both") -> Dict[str, Any]:
     """
@@ -1736,6 +2216,7 @@ def build_risk_summary(report: Dict[str, Any]) -> str:
             "Territory concentration risk",
             "Missing reporting periods",
             "Platform revenue anomalies",
+            "Package coverage gaps",
         }):
             cats.append(f.get("category"))
 
@@ -1749,7 +2230,9 @@ def build_risk_summary(report: Dict[str, Any]) -> str:
         "Territory concentration risk": "Possible missing territory scope",
         "Missing reporting periods": "Missing reporting periods",
         "Platform revenue anomalies": "Platform revenue anomalies",
+        "Package coverage gaps": "Missing statement coverage (package-level)",
     }
+
 
     labels = [mapping.get(c, c) for c in cats]
     return "Risk Summary: " + "; ".join(labels) + "."
@@ -1757,6 +2240,20 @@ def build_risk_summary(report: Dict[str, Any]) -> str:
 
 def generate_executive_docx(report: Dict[str, Any]) -> str:
     doc = Document()
+
+    from pathlib import Path
+
+    # Identify this unit clearly (for title + filename)
+    inp = report.get("input", {}) or {}
+
+    artist_name = (
+        inp.get("artist_name")
+        or inp.get("artist_key")
+        or inp.get("sheet")
+        or inp.get("zip_member")
+        or Path(inp.get("source_path", "")).stem
+        or "Unknown_Unit"
+    )
 
     normal = doc.styles["Normal"]
     normal.font.name = "Calibri"
@@ -1768,6 +2265,21 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
     doc.styles["Heading 2"].font.size = Pt(14)
     doc.styles["Heading 3"].font.name = "Calibri"
     doc.styles["Heading 3"].font.size = Pt(12)
+
+# ============================================================
+# EXECUTIVE DOCX (PER UNIT)
+# ============================================================
+
+def generate_executive_docx(report: Dict[str, Any]) -> str:
+    from docx import Document
+    from docx.shared import Pt, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    doc = Document()
+
+    # ---------- Helper functions (must stay INSIDE this function) ----------
 
     def set_cell_shading(cell, fill="F3F4F6"):
         tcPr = cell._tc.get_or_add_tcPr()
@@ -1792,390 +2304,151 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
             set_cell_shading(c, header_fill)
             bold_cell(c, size=10)
 
-        for ridx, r in enumerate(table.rows[1:], start=1):
-            for c in r.cells:
-                for p in c.paragraphs:
-                    for run in p.runs:
-                        run.font.size = Pt(10)
-            if zebra and (ridx % 2 == 0):
-                for c in r.cells:
-                    set_cell_shading(c, "F6F7F9")
-
-    def add_divider():
-        p = doc.add_paragraph("—" * 28)
-        p.paragraph_format.space_before = Pt(6)
-        p.paragraph_format.space_after = Pt(10)
+    # ---------- Metadata ----------
 
     local_now = datetime.now()
     display_date = local_now.strftime("%B %d, %Y")
     filename_date = local_now.strftime("%Y-%m")
 
-    source_path = report.get("input", {}).get("source_path", "") or ""
-    artist_name = source_path.split(".")[0] if source_path else "Unknown_Artist"
-    filename = f"RI_Report_{artist_name}_{filename_date}.docx"
+    inp = report.get("input", {}) or {}
+
+    source_path = inp.get("source_path", "") or ""
+    base_slug = Path(source_path).stem.replace(" ", "_") if source_path else "Unknown_Source"
+
+    sheet = inp.get("sheet")
+    zip_member = inp.get("zip_member")
+    artist_key = inp.get("artist_key")
+
+    parts = [base_slug]
+
+    # Prefer explicit identity fields when present
+    if zip_member:
+        parts.append(Path(zip_member).stem.replace(" ", "_"))
+    if sheet:
+        parts.append(str(sheet).replace(" ", "_"))
+    if artist_key and str(artist_key) not in parts:
+        parts.append(str(artist_key).replace(" ", "_"))
+
+    # fallback if none of the above existed
+    unit_slug = "_".join([p for p in parts if p]) or "Unit"
+
+    filename = f"RI_Report_{unit_slug}_{filename_date}.docx"
+
+    # ---------- Title ----------
 
     title = doc.add_heading("Royalty Intelligence", level=1)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
+    inp = report.get("input", {}) or {}
+    artist_name = (
+            inp.get("artist_name")
+            or inp.get("artist_key")
+            or inp.get("sheet")
+            or inp.get("zip_member")
+            or Path(inp.get("source_path", "")).stem
+            or "Unknown_Unit"
+    )
     sub = doc.add_paragraph(artist_name)
     sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    date_para = doc.add_paragraph(f"Report Date: {display_date}")
-    date_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph(f"Report Date: {display_date}")
 
-    doc.add_paragraph("")
-
-    # ---------- EXECUTIVE OVERVIEW ----------
-    h = doc.add_heading("Executive Overview", level=2)
-    h.paragraph_format.keep_with_next = False
-    h.paragraph_format.keep_together = False
+    # ---------- Simple Summary ----------
 
     total_amount = float(report.get("summary", {}).get("total_amount", 0.0) or 0.0)
-    statement_type = report.get("summary", {}).get("statement_type", "Unknown")
+    doc.add_paragraph(f"Total Revenue Reported: ${total_amount:,.2f}")
 
-    overview_text = (
-        "This report reviews the uploaded royalty statement and provides structural analysis, "
-        "coverage mapping, and contextual prioritization insights. "
-        f"The upload appears to be a {statement_type}-level export reflecting "
-        f"${total_amount:,.2f} in reported revenue. "
-        "Where applicable, adjacent royalty streams may warrant review depending on ownership structure, splits, "
-        "and registrations."
-    )
-    p = doc.add_paragraph(overview_text)
-    p.paragraph_format.space_after = Pt(6)
-
-    risk_line = build_risk_summary(report)
-    rp = doc.add_paragraph(risk_line)
-    rp.runs[0].bold = True
-    rp.paragraph_format.space_after = Pt(6)
-
-    rr = report.get("revenue_risk_level", {}) or {}
-    level = rr.get("revenue_risk_level")
-    meaning = rr.get("meaning")
-    start = rr.get("recommended_start")
-
-    if level and meaning and start:
-        p = doc.add_paragraph()
-        r1 = p.add_run("Revenue Risk Level:")
-        r1.bold = True
-        p.add_run(f" {level}")
-
-        p = doc.add_paragraph()
-        r2 = p.add_run("Meaning:")
-        r2.bold = True
-        p.add_run(f" {meaning}")
-
-        p = doc.add_paragraph()
-        r3 = p.add_run("Start with:")
-        r3.bold = True
-        p.add_run(f" {start}")
-        doc.add_paragraph("")
-
-    add_divider()
-
-    # ---------- START HERE: WHERE TO LOOK FIRST ----------
-    h = doc.add_heading("Start Here: Where to Look First", level=2)
-    h.paragraph_format.keep_with_next = False
-    h.paragraph_format.keep_together = False
-
-    range_map = {}
-    for r in report.get("estimated_contextual_ranges", []):
-        stream = r.get("stream", "")
-        low = float(r.get("estimated_range_usd", {}).get("low", 0.0) or 0.0)
-        high = float(r.get("estimated_range_usd", {}).get("high", 0.0) or 0.0)
-        range_map[stream] = {
-            "range": f"${low:,.0f} – ${high:,.0f}",
-            "confidence": r.get("confidence", "Unknown"),
-        }
-
-    top = (report.get("prioritized_opportunities", []) or [])[:3]
-
-    callout = doc.add_table(rows=1, cols=1)
-    callout.allow_autofit = True
-    callout.style = "Table Grid"
-    cell = callout.rows[0].cells[0]
-    set_cell_shading(cell, "F2F7FF")
-    cell.paragraphs[0].text = ""
-
-    if top:
-        for i, opp in enumerate(top, start=1):
-            stream = opp.get("stream", "Unknown Stream")
-            rinfo = range_map.get(stream, {"range": "N/A", "confidence": "Unknown"})
-            text = f"{i}. {stream} — Est. {rinfo['range']} (Confidence: {rinfo['confidence']})"
-            pp = cell.add_paragraph(text)
-            if pp.runs:
-                pp.runs[0].bold = True
-            pp.paragraph_format.left_indent = Pt(18)
-            pp.paragraph_format.first_line_indent = Pt(-18)
-            pp.paragraph_format.space_after = Pt(2)
-
-        p2 = cell.add_paragraph(
-            "Suggested next step: confirm registrations and reporting coverage for the top item(s), "
-            "then request the most detailed line-item export available to validate drivers by track/territory."
-        )
-        p2.paragraph_format.space_before = Pt(6)
-    else:
-        p2 = cell.add_paragraph(
-            "Suggested next step: upload a more detailed export (ideally line-item with track/ISRC and earnings), "
-            "then re-run this report for deeper validation."
-        )
-        p2.paragraph_format.space_before = Pt(6)
-
-    p = doc.add_paragraph()
-    run1 = p.add_run("Tip:")
-    run1.bold = True
-    p.add_run(
-        " Start with the top item above, confirm registrations + reporting sources, then request line-item exports to validate drivers.")
-    p.paragraph_format.space_before = Pt(4)
-    p.paragraph_format.space_after = Pt(0)
-
-    add_divider()
-
-    drivers = report.get("top_revenue_drivers", []) or []
-    if drivers:
-        h = doc.add_heading("Top Revenue Drivers (From This Upload)", level=2)
-        h.paragraph_format.keep_with_next = False
-        h.paragraph_format.keep_together = False
-
-        total_upload = sum(float(d.get("amount_usd", 0.0)) for d in drivers)
-        top3 = drivers[:3]
-        top3_total = sum(float(d.get("amount_usd", 0.0)) for d in top3)
-
-        if total_upload > 0:
-            pct = (top3_total / total_upload) * 100
-            insight = (
-                f"The top {len(top3)} track(s) represent approximately "
-                f"{pct:.1f}% of reported revenue in this upload. "
-                "If adjacent royalty streams exist (mechanical, performance, neighboring rights), "
-                "these works should be prioritized for registration and verification first."
-            )
-            ip = doc.add_paragraph(insight)
-            ip.paragraph_format.space_after = Pt(6)
-
-        table = doc.add_table(rows=1, cols=4)
-        style_table(table)
-        hdr = table.rows[0].cells
-        hdr[0].text = "Track Title"
-        hdr[1].text = "Platform"
-        hdr[2].text = "Territory"
-        hdr[3].text = "Amount (USD)"
-
-        for d in drivers:
-            row = table.add_row().cells
-            row[0].text = str(d.get("track_title", ""))[:60]
-            row[1].text = str(d.get("platform_org", ""))[:30]
-            row[2].text = str(d.get("territory", ""))[:20]
-            row[3].text = f"${float(d.get('amount_usd', 0.0)):,.2f}"
-
-        note = doc.add_paragraph()
-        run1 = note.add_run("Note:")
-        run1.bold = True
-        note.add_run(
-            " These are the highest-earning items inside the uploaded file only. "
-            "If this export is partial (single platform/territory), drivers may shift once full coverage is uploaded."
-        )
-        note.paragraph_format.space_before = Pt(4)
-        note.paragraph_format.space_after = Pt(0)
-
-    # ---------- ESTIMATED OPPORTUNITY REVIEW ----------#
-    h = doc.add_heading("Estimated Opportunity Review", level=2)
-    h.paragraph_format.keep_with_next = False
-    h.paragraph_format.keep_together = False
-
-    ranges = report.get("estimated_contextual_ranges", []) or []
-    priorities = report.get("prioritized_opportunities", []) or []
-    priority_map = {p.get("stream"): p.get("priority_rank") for p in priorities if p.get("stream")}
-
-    table = doc.add_table(rows=1, cols=4)
-    style_table(table)
-    table.columns[0].width = Inches(1.0)
-    table.columns[1].width = Inches(2.8)
-    table.columns[2].width = Inches(1.6)
-    table.columns[3].width = Inches(1.1)
-
-    hdr = table.rows[0].cells
-    hdr[0].text = "Priority"
-    hdr[1].text = "Revenue Stream"
-    hdr[2].text = "Estimated Range (USD)"
-    hdr[3].text = "Confidence"
-
-    for item in ranges:
-        stream = item.get("stream", "Unknown Stream")
-        low = float(item.get("estimated_range_usd", {}).get("low", 0.0) or 0.0)
-        high = float(item.get("estimated_range_usd", {}).get("high", 0.0) or 0.0)
-
-        rank = priority_map.get(stream)
-        if rank == 1:
-            priority_label = "High"
-        elif rank == 2:
-            priority_label = "Medium"
-        else:
-            priority_label = "Low"
-
-        row = table.add_row().cells
-        row[0].text = priority_label
-        row[1].text = stream
-        row[2].text = f"${low:,.0f} – ${high:,.0f}"
-        row[3].text = item.get("confidence", "Unknown")
-
-    add_divider()
-
-    # ---------- TREND INTELLIGENCE ----------#
-    trend = report.get("trend_intelligence", {}) or {}
-    signals = trend.get("signals", []) or []
-
-    if signals:
-        h = doc.add_heading("Trend Intelligence (Cross-Period)", level=2)
-        h.paragraph_format.keep_with_next = False
-        h.paragraph_format.keep_together = False
-
-        # ---------- Window (show once) ----------
-        window = trend.get("window_label") or trend.get("window")
-        if window:
-            p = doc.add_paragraph()
-            r = p.add_run("Window:")
-            r.bold = True
-            p.add_run(f" {window}")
-            doc.add_paragraph("")
-
-        # Friendly names (so non-technical readers get it)
-        FRIENDLY = {
-            "PORTFOLIO_BEHAVIOR": "Portfolio Behavior",
-            "REVENUE_TRAJECTORY": "Revenue Trajectory",
-            "TERRITORY_DISAPPEARANCE": "Territory Disappearance",
-        }
-
-        # Normalize + prioritize (best UX flow)
-        ORDER = ["PORTFOLIO_BEHAVIOR", "REVENUE_TRAJECTORY", "TERRITORY_DISAPPEARANCE"]
-
-        grouped = {}
-        for s in signals:
-            grouped.setdefault(s.get("signal_type", "OTHER"), []).append(s)
-
-        # Render in the order we want
-        ordered_types = [t for t in ORDER if t in grouped] + [t for t in grouped.keys() if t not in ORDER]
-
-        for sig_type in ordered_types:
-            items = grouped.get(sig_type, [])
-            title = FRIENDLY.get(sig_type, sig_type.replace("_", " ").title())
-
-            sh = doc.add_paragraph()
-            r = sh.add_run(f"{title}:")
-            r.bold = True
-
-            for s in items:
-                summary = (s.get("summary") or "").strip()
-                sev = s.get("severity", "Unknown")
-                conf = s.get("confidence", "Unknown")
-                rec = (s.get("recommended_action") or "").strip()
-
-                sev = "Medium" if sev in {"Med", "Medium"} else sev
-                conf = "Medium" if conf in {"Med", "Medium"} else conf
-
-                # Main bullet
-                p1 = doc.add_paragraph(f"• {summary}")
-
-                # Severity / Confidence line
-                p2 = doc.add_paragraph(f"(Impact: {sev} | Certainty: {conf})")
-
-                # NEW: Start here line
-                if rec:
-                    p3 = doc.add_paragraph()
-                    r = p3.add_run("Start here:")
-                    r.bold = True
-                    p3.add_run(f" {rec}")
-
-                doc.add_paragraph("")
-
-        # ---------- How to use this (bold prefix before colon) ----------
-        p = doc.add_paragraph()
-        r = p.add_run("How to use this:")
-        r.bold = True
-        p.add_run(
-            " Treat these as investigation triggers. Prioritize validating reporting completeness, "
-            "confirming territory coverage, and reconciling any recent distribution or rights changes."
-        )
-
-        add_divider()
-
-    # ---------- ROYALTY STREAM COVERAGE ----------#
-    h = doc.add_heading("Royalty Stream Coverage", level=2)
-    h.paragraph_format.keep_with_next = False
-    h.paragraph_format.keep_together = False
-
-    coverage = report.get("coverage_overview", []) or []
-    table = doc.add_table(rows=1, cols=2)
-    style_table(table)
-    table.columns[0].width = Inches(5.0)
-    table.columns[1].width = Inches(1.0)
-
-    hdr = table.rows[0].cells
-    hdr[0].text = "Revenue Stream"
-    hdr[1].text = "Represented"
-
-    for item in coverage:
-        represented = item.get("represented_in_upload")
-        if represented is True:
-            rep_text = "Yes"
-        elif represented is False:
-            rep_text = "No"
-        else:
-            rep_text = "Unknown"
-
-        row = table.add_row().cells
-        row[0].text = str(item.get("stream", ""))
-        row[1].text = rep_text
-
-    add_divider()
-
-    h = doc.add_heading("Key Insights", level=2)
-    h.paragraph_format.keep_with_next = False
-    h.paragraph_format.keep_together = False
-
-    doc.add_paragraph(
-        "This upload reflects only the revenue present in the provided export. "
-        "If composition or neighboring rights collections are expected, validating registrations and reporting sources "
-        "may provide additional clarity. Concentration signals can help prioritize where deeper audit work is most likely to pay off."
-    )
+    # ---------- Findings ----------
 
     findings = report.get("findings", []) or []
-    if not findings:
-        doc.add_paragraph("• No anomalies were detected by the current rule set for this upload.")
-    else:
-        platform_msgs, territory_msgs, other_msgs = [], [], []
+
+    if findings:
+        doc.add_heading("Findings", level=2)
         for f in findings:
-            cat = (f.get("category", "") or "").strip()
-            summ = (f.get("summary", "") or "").strip()
-            if cat in {"Revenue concentration", "Coverage gap risk"}:
-                platform_msgs.append(summ)
-            elif cat in {"Territory concentration risk"}:
-                territory_msgs.append(summ)
-            else:
-                other_msgs.append(summ)
+            doc.add_paragraph(f"• {f.get('summary')}", style="List Bullet")
+    else:
+        doc.add_paragraph("No findings detected.")
 
-        if platform_msgs:
-            combined = " ".join(dict.fromkeys(platform_msgs))
-            pp = doc.add_paragraph(f"• Platform coverage: {combined}")
-            pp.paragraph_format.space_after = Pt(2)
+    doc.save(filename)
+    return filename
 
-        if territory_msgs:
-            combined = " ".join(dict.fromkeys([m for m in territory_msgs if m]))
-            pp = doc.add_paragraph(f"• Territory scope: {combined}")
-            pp.paragraph_format.space_after = Pt(2)
 
-        for msg in dict.fromkeys([m for m in other_msgs if m]):
-            pp = doc.add_paragraph(f"• {msg}")
-            pp.paragraph_format.space_after = Pt(2)
+# ============================================================
+# MASTER PACKAGE DOCX
+# ============================================================
 
-    add_divider()
+def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
+    from docx import Document
 
-    h = doc.add_heading("Disclosures", level=3)
-    h.paragraph_format.keep_with_next = False
-    h.paragraph_format.keep_together = False
+    package_meta = package_report.get("package_meta", {}) or {}
+    rollup = package_report.get("workbook_rollup", {}) or {}
+    coverage = package_report.get("package_coverage", {}) or {}
+    units = rollup.get("units", []) or []
 
-    for d in report.get("disclosures", []) or []:
-        pp = doc.add_paragraph(d)
-        pp.paragraph_format.space_after = Pt(2)
+    doc = Document()
+
+    doc.add_heading("Royalty Intelligence — Package Executive Report", level=1)
+
+    source_name = package_meta.get("source_path", "Package")
+    doc.add_paragraph(f"Source: {source_name}")
+    doc.add_paragraph(f"Units analyzed: {rollup.get('unit_count', 0)}")
+
+    total_revenue = sum([u.get("total_amount", 0) or 0 for u in units])
+    doc.add_paragraph(f"Total reported revenue (all units): ${total_revenue:,.2f}")
+
+    # Coverage
+    doc.add_heading("Statement Coverage", level=2)
+
+    present = coverage.get("families_present", {}) or {}
+    missing = coverage.get("missing_families", []) or []
+    recs = coverage.get("recommended_next_uploads", []) or []
+
+    if present:
+        doc.add_paragraph("Coverage present:")
+        for k, v in present.items():
+            doc.add_paragraph(f"- {k} ({v} units)", style="List Bullet")
+
+    if missing:
+        doc.add_paragraph("Missing coverage:")
+        for m in missing:
+            doc.add_paragraph(f"- {m}", style="List Bullet")
+
+    if recs:
+        doc.add_paragraph("Recommended next uploads:")
+        for r in recs:
+            doc.add_paragraph(f"- {r}", style="List Bullet")
+
+    # Top Revenue Units
+    doc.add_heading("Top Revenue Units", level=2)
+
+    top_units = sorted(units, key=lambda x: x.get("total_amount", 0) or 0, reverse=True)[:3]
+
+    for u in top_units:
+        doc.add_paragraph(
+            f"- {u.get('unit_name')}: ${u.get('total_amount', 0):,.2f}",
+            style="List Bullet"
+        )
+
+    # High Severity Findings
+    doc.add_heading("High Risk Flags", level=2)
+
+    high_flags = []
+    for r in package_report.get("unit_reports", []) or []:
+        for f in r.get("findings", []) or []:
+            if f.get("severity") == "High":
+                high_flags.append(f.get("summary"))
+
+    high_flags = list(set(high_flags))[:5]
+
+    if high_flags:
+        for flag in high_flags:
+            doc.add_paragraph(f"- {flag}", style="List Bullet")
+    else:
+        doc.add_paragraph("No high severity findings detected.")
+
+    filename_date = datetime.now().strftime("%Y-%m")
+    base_slug = Path(source_name).stem.replace(" ", "_")
+    filename = f"RI_Master_Package_Report_{base_slug}_{filename_date}.docx"
 
     doc.save(filename)
     return filename
@@ -2186,34 +2459,99 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
 # ============================================================
 
 if __name__ == "__main__":
-    input_path = "We The Best Clients.xlsx"
-    out_path = "royalty_intelligence_report.json"
+    import argparse
+    from pathlib import Path
 
-    report = analyze_file(input_path)
+    parser = argparse.ArgumentParser(description="Royalty Intelligence - Local Demo Runner")
+    parser.add_argument("input", help="Path to file (.csv/.xlsx/.zip)")
+    parser.add_argument("--outdir", default="reports", help="Output directory for reports")
+    parser.add_argument("--verbose", action="store_true", help="Print debug logs")
+    args = parser.parse_args()
 
-    # --- Pick the correct report object for single-report functions (DOCX/summary/prints) ---
-    if isinstance(report, dict) and "portfolio_report" in report:
-        main_report = report["portfolio_report"]
-        artist_count = len(report.get("artist_reports", []))
-        print(f"Workbook mode: {artist_count} artist tabs analyzed")
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Run package analysis
+    package_report = analyze_package(args.input, verbose=args.verbose)
+
+    # Save JSON
+    json_path = outdir / "royalty_intelligence_report.json"
+    write_report_json(package_report, str(json_path))
+
+    # Print clean demo summary
+    rollup = package_report.get("workbook_rollup", {}) or {}
+    units = rollup.get("units", []) or []
+    coverage = package_report.get("package_coverage", {}) or {}
+
+    print("\n=== Royalty Intelligence Demo ===")
+    print(f"Input: {args.input}")
+    print(f"Units analyzed: {rollup.get('unit_count', len(units))}")
+
+    top_units = sorted(
+        units,
+        key=lambda x: x.get("total_amount", 0) or 0,
+        reverse=True
+    )[:5]
+
+    print("\nTop units by reported revenue:")
+    for u in top_units:
+        name = u.get("unit_name") or u.get("sheet") or u.get("zip_member") or "Unit"
+        amt = float(u.get("total_amount", 0) or 0)
+        print(f" - {name}: ${amt:,.2f}")
+
+    present = coverage.get("families_present", {}) or {}
+    missing = coverage.get("missing_families", []) or []
+
+    if present:
+        present_str = ", ".join([f"{k}({v})" for k, v in present.items()])
+        print(f"\nCoverage present: {present_str}")
+
+    if missing:
+        print("Missing coverage:", ", ".join(missing))
+
+    recs = coverage.get("recommended_next_uploads", []) or []
+    if recs:
+        print("\nRecommended next uploads:")
+        for r in recs[:6]:
+            print(f" - {r}")
+
+    # --- Generate a DOCX per unit (real-world expectation) ---
+    unit_reports = package_report.get("unit_reports", []) or []
+    master_docx = None
+
+    if not unit_reports:
+        print("\nNo analyzable units found in the uploaded file.")
     else:
-        main_report = report
+        for r in unit_reports:
+            inp = r.get("input", {}) or {}
+            unit_name = (
+                inp.get("artist_name")
+                or inp.get("artist_key")
+                or inp.get("sheet")
+                or inp.get("zip_member")
+                or "Unit"
+            )
 
-    # --- Generate DOCX from the main report ---
-    docx_filename = generate_executive_docx(main_report)
-    print(f"DOCX Report Generated: {docx_filename}")
+            docx_filename = generate_executive_docx(r)
 
-    # --- Write JSON (write the full bundle if present) ---
-    write_report_json(report, out_path)
-    print(f"Wrote: {out_path}")
+            # move to reports folder
+            p = Path(docx_filename)
+            try:
+                p.replace(outdir / p.name)
+                docx_filename = str(outdir / p.name)
+            except Exception:
+                pass
 
-    # --- Print summary safely ---
-    print(f"Findings: {main_report.get('summary', {}).get('findings_count', 0)}")
+            print(f"\nUnit report: {unit_name}: {docx_filename}")
 
-    # --- Optional: quick signal debug ---
-    trend = main_report.get("trend_intelligence", {}) or {}
-    signals = trend.get("signals", []) or []
-    print(f"Trend signals: {len(signals)}")
+        # Generate master package DOCX (after units)
+        master_docx = generate_master_package_docx(package_report)
+        mp = Path(master_docx)
+        try:
+            mp.replace(outdir / mp.name)
+            master_docx = str(outdir / mp.name)
+        except Exception:
+            pass
 
-    # --- Metadata print (safe for both modes) ---
-    print("Loaded file metadata:", report.get("input", {}))
+    print(f"\nMaster package report: {master_docx if master_docx else '(not generated)'}")
+    print(f"JSON report: {json_path}\n")
