@@ -4,7 +4,7 @@ from pathlib import Path
 
 import streamlit as st
 
-# Import your working functions from royalty_mvp.py
+# Import your working backend
 from royalty_mvp import (
     analyze_package,
     compute_cross_stream_diagnostics,
@@ -13,42 +13,38 @@ from royalty_mvp import (
     write_report_json,
 )
 
-st.set_page_config(page_title="Royalty Intelligence MVP", layout="wide")
+st.set_page_config(page_title="Royalty Intelligence", layout="wide")
 
-st.title("Royalty Intelligence — MVP Demo")
-st.caption("Upload a royalty statement package (.zip/.xlsx/.csv). Generates a master package report + unit reports + JSON.")
+st.title("Royalty Intelligence")
+st.caption("Upload a royalty statement package to generate diagnostic reports.")
 
-uploaded = st.file_uploader("Upload statements package", type=["zip", "xlsx", "xls", "csv", "tsv", "txt"])
+uploaded = st.file_uploader(
+    "Upload statements package",
+    type=["zip", "xlsx", "xls", "csv", "tsv", "txt"]
+)
 
-outdir = st.text_input("Output folder", value="reports")
-verbose = st.checkbox("Verbose logs", value=False)
-
-run = st.button("Run Diagnostic")
-
-if run:
+if st.button("Run Diagnostic"):
     if not uploaded:
         st.error("Please upload a file first.")
         st.stop()
 
-    # Ensure output folder exists
-    out_path = Path(outdir)
-    out_path.mkdir(parents=True, exist_ok=True)
-
-    # Save upload to a temp file so your existing pipeline can read it by path
+    # Save upload temporarily so your existing pipeline can read by file path
     suffix = Path(uploaded.name).suffix or ".zip"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded.getbuffer())
         input_path = tmp.name
 
     try:
-        st.write("Running analysis...")
-        package_report = analyze_package(input_path, verbose=verbose)
+        st.info("Running analysis...")
+
+        # Run full package analysis
+        package_report = analyze_package(input_path)
 
         # Ensure cross-stream diagnostics exist
         cross_stream = package_report.get("cross_stream_diagnostics") or compute_cross_stream_diagnostics(package_report)
         package_report["cross_stream_diagnostics"] = cross_stream
 
-        # Attach package_context to units so per-unit DOCX includes package intelligence
+        # Attach package context to units (so unit docs reference package intelligence)
         unit_reports = package_report.get("unit_reports", []) or []
         package_coverage = package_report.get("package_coverage", {}) or {}
 
@@ -58,55 +54,37 @@ if run:
                 "cross_stream_diagnostics": cross_stream,
             }
 
-        # Generate unit docs
+        # Generate master DOCX
+        master_docx = generate_master_package_docx(package_report)
+
+        # Generate unit DOCX files
         unit_doc_paths = []
         for r in unit_reports:
             docx_filename = generate_executive_docx(r)
-            p = Path(docx_filename)
-            final = out_path / p.name
-            try:
-                p.replace(final)
-                unit_doc_paths.append(str(final))
-            except Exception:
-                unit_doc_paths.append(str(p))
+            unit_doc_paths.append(docx_filename)
 
-        # Generate master doc
-        master_docx = generate_master_package_docx(package_report)
-        mp = Path(master_docx)
-        master_final = out_path / mp.name
-        try:
-            mp.replace(master_final)
-            master_docx = str(master_final)
-        except Exception:
-            master_docx = str(mp)
+        # Save JSON temporarily
+        json_path = "royalty_intelligence_report.json"
+        write_report_json(package_report, json_path)
 
-        # Save JSON
-        json_path = out_path / "royalty_intelligence_report.json"
-        write_report_json(package_report, str(json_path))
+        st.success("Diagnostic complete.")
 
-        # UI Outputs
-        st.success("Done.")
-        st.subheader("Downloads")
+        # -------------------------
+        # Downloads
+        # -------------------------
 
-        # Master doc download
+        st.subheader("Download Reports")
+
+        # Master report
         with open(master_docx, "rb") as f:
             st.download_button(
-                label="Download Master Package Report (DOCX)",
+                label="Download Master Package Report",
                 data=f,
                 file_name=Path(master_docx).name,
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
 
-        # JSON download
-        with open(json_path, "rb") as f:
-            st.download_button(
-                label="Download JSON Report",
-                data=f,
-                file_name=json_path.name,
-                mime="application/json",
-            )
-
-        # Unit doc downloads
+        # Unit reports
         if unit_doc_paths:
             st.subheader("Unit Reports")
             for p in unit_doc_paths:
@@ -118,19 +96,38 @@ if run:
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     )
 
-        # Small preview panel
+        # JSON
+        with open(json_path, "rb") as f:
+            st.download_button(
+                label="Download JSON Report",
+                data=f,
+                file_name=json_path,
+                mime="application/json",
+            )
+
+        # -------------------------
+        # Small On-Screen Summary
+        # -------------------------
+
         st.subheader("Quick Summary")
+
         rollup = package_report.get("workbook_rollup", {}) or {}
-        st.write(f"Units analyzed: {rollup.get('unit_count', 0)}")
-        st.write("Coverage present:", package_report.get("package_coverage", {}).get("families_present", {}))
-        st.write("Missing coverage:", package_report.get("package_coverage", {}).get("missing_families", []))
-        st.write("Top signals:", [s.get("summary") for s in (cross_stream.get("signals") or [])[:3]])
+        st.write("Units analyzed:", rollup.get("unit_count", 0))
+        st.write("Coverage present:", package_coverage.get("families_present", {}))
+        st.write("Missing coverage:", package_coverage.get("missing_families", []))
+
+        signals = (cross_stream.get("signals") or [])[:3]
+        if signals:
+            st.write("Top Signals:")
+            for s in signals:
+                st.write("•", s.get("summary"))
 
     except Exception as e:
-        st.error(f"Error: {type(e).__name__}: {e}")
+        st.error(f"{type(e).__name__}: {e}")
+
     finally:
-        # Clean temp upload file
         try:
             os.remove(input_path)
         except Exception:
             pass
+
