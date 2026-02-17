@@ -1,23 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Literal
 import hashlib
 import io
 import json
 import zipfile
-
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Pt, Inches
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
 
 
 # ============================================================
@@ -2076,6 +2070,132 @@ def build_package_coverage_finding(package_coverage: Dict[str, Any]) -> Optional
         "evidence": [],  # package-level, not row-level
     }
     return finding
+def compute_cross_stream_diagnostics(package_report: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Package-level diagnostic layer: cross-references unit reports, infers implied streams,
+    and flags misalignment / under-indexing across streams.
+    """
+
+    rollup = package_report.get("workbook_rollup", {}) or {}
+    coverage = package_report.get("package_coverage", {}) or {}
+    unit_reports = package_report.get("unit_reports", []) or []
+    units = rollup.get("units", []) or []
+
+    present = coverage.get("families_present", {}) or {}
+    missing = set(coverage.get("missing_families", []) or [])
+
+    # ----------------------------------------------------
+    # Revenue by statement family
+    # ----------------------------------------------------
+    revenue_by_family = {}
+
+    for r in unit_reports:
+        fam = (r.get("summary", {}) or {}).get("statement_family") or "UNKNOWN"
+        amt = float((r.get("summary", {}) or {}).get("total_amount", 0.0) or 0.0)
+        revenue_by_family[fam] = revenue_by_family.get(fam, 0.0) + amt
+
+    # ----------------------------------------------------
+    # Diagnostic containers
+    # ----------------------------------------------------
+    implied = []
+    signals = []
+    actions = []
+
+    master_rev = revenue_by_family.get("DISTRIBUTOR_LABEL_MASTER", 0.0)
+
+    # ----------------------------------------------------
+    # 1) MLC implied by DSP master revenue
+    # ----------------------------------------------------
+    if master_rev > 0 and "MLC_MECHANICAL" in missing:
+        implied.append({
+            "stream": "MLC_MECHANICAL",
+            "probability": 0.75,
+            "reason": "DSP master revenue present; US mechanicals typically exist if compositions are registered/claimed."
+        })
+
+        signals.append({
+            "signal_type": "MISSING_BUT_IMPLIED",
+            "severity": "High" if master_rev >= 250000 else "Medium",
+            "confidence": "High",
+            "summary": "Mechanical royalties (MLC) appear missing but are strongly implied by DSP master revenue.",
+            "recommended_action": "Upload the MLC statement/export for the same months; confirm works are registered/claimed and matched."
+        })
+
+        actions.append(
+            "Request/download MLC details for the same reporting window; verify songwriter/publisher registrations and matches."
+        )
+
+    # ----------------------------------------------------
+    # 2) PRO implied
+    # ----------------------------------------------------
+    if master_rev > 0 and "PRO_PERFORMANCE" in missing:
+        implied.append({
+            "stream": "PRO_PERFORMANCE",
+            "probability": 0.60,
+            "reason": "DSP revenue implies public performance depending on territory and registrations."
+        })
+
+        signals.append({
+            "signal_type": "MISSING_BUT_IMPLIED",
+            "severity": "Medium",
+            "confidence": "Medium",
+            "summary": "PRO performance statements may be missing for at least one key territory.",
+            "recommended_action": "Upload ASCAP/BMI/SESAC/PRS (or relevant PRO) distributions for the same window; verify work registrations."
+        })
+
+        actions.append(
+            "Pull PRO distributions for the same window; confirm registrations/CAE/IPI and work-title matching."
+        )
+
+    # ----------------------------------------------------
+    # 3) Neighboring rights implied
+    # ----------------------------------------------------
+    if master_rev > 0 and "NEIGHBORING_RIGHTS" in missing:
+        implied.append({
+            "stream": "NEIGHBORING_RIGHTS",
+            "probability": 0.45,
+            "reason": "If recordings have radio/digital public performance exposure, neighboring rights can exist."
+        })
+
+        signals.append({
+            "signal_type": "MISSING_BUT_IMPLIED",
+            "severity": "Low",
+            "confidence": "Medium",
+            "summary": "Neighboring rights statements are not present; may be relevant depending on radio/digital performance exposure.",
+            "recommended_action": "If radio/digital performance is expected, upload SoundExchange/PPL/GVL statements (same window)."
+        })
+
+    # ----------------------------------------------------
+    # 4) Under-index check (PRO vs Master)
+    # ----------------------------------------------------
+    pro_rev = revenue_by_family.get("PRO_PERFORMANCE", 0.0)
+
+    if master_rev > 0 and pro_rev > 0:
+        ratio = pro_rev / master_rev
+
+        if ratio < 0.01:
+            signals.append({
+                "signal_type": "UNDER_INDEX",
+                "severity": "Medium",
+                "confidence": "Medium",
+                "summary": "Performance revenue appears low relative to master revenue; could indicate incomplete registrations, territory gaps, or timing mismatches.",
+                "recommended_action": "Confirm works are registered correctly at PRO(s); check territory coverage and statement window alignment."
+            })
+
+    # ----------------------------------------------------
+    # Final structured output
+    # ----------------------------------------------------
+    return {
+        "total_units": len(units),
+        "present_families": list(present.keys()),
+        "missing_families": sorted(list(missing)),
+        "revenue_by_family": revenue_by_family,
+        "implied_streams": implied,
+        "signals": signals,
+        "recommended_actions": actions[:6],
+    }
+
+
 
 def analyze_package(input_path: str, verbose: bool = False) -> Dict[str, Any]:
     pkg = load_statement_package(input_path)
@@ -2106,10 +2226,11 @@ def analyze_package(input_path: str, verbose: bool = False) -> Dict[str, Any]:
             summ["top_categories"] = pd.Series(cats).value_counts().to_dict() if cats else {}
             r["summary"] = summ
 
+    # Keep a simple pointer too (fine to keep)
     for r in unit_reports:
         r["package_coverage"] = package_coverage
 
-    # Rollup summary
+    # Rollup summary (MUST exist before cross-stream uses it)
     rollup = {
         "unit_count": len(unit_reports),
         "units": [
@@ -2127,7 +2248,8 @@ def analyze_package(input_path: str, verbose: bool = False) -> Dict[str, Any]:
         ],
     }
 
-    return {
+    # Build a package_report object first (real-world: everything in one structure)
+    package_report: Dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "package_meta": package_meta,
         "workbook_rollup": rollup,
@@ -2135,54 +2257,16 @@ def analyze_package(input_path: str, verbose: bool = False) -> Dict[str, Any]:
         "package_coverage": package_coverage,
     }
 
-def analyze_file(input_path: str, mode: str = "both") -> Dict[str, Any]:
-    """
-    mode:
-      - "portfolio"  => one combined report (all rows)
-      - "per_artist" => one report per sheet/artist_key (returns a bundle)
-      - "both"       => portfolio + per-artist bundle
-    """
-    df, load_meta = load_statement_file(input_path)
+    # Cross-stream diagnostics ONCE, using the complete package context
+    cross_stream = compute_cross_stream_diagnostics(package_report)
+    package_report["cross_stream_diagnostics"] = cross_stream
 
-    sheet_count = int(load_meta.get("sheet_count", 0) or 0)
+    # Optional: also attach to each unit so unit DOCX can reference it
+    for r in unit_reports:
+        r["cross_stream_diagnostics"] = cross_stream
 
-    # Not a workbook (or only 1 sheet) -> normal single report
-    if sheet_count <= 1:
-        return analyze_dataframe(df, load_meta)
+    return package_report
 
-    # Workbook bundle
-    results: Dict[str, Any] = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "input": load_meta,
-        "mode": mode,
-    }
-
-    # Portfolio report (all sheets combined)
-    if mode in {"portfolio", "both"}:
-        portfolio_meta = dict(load_meta)
-        portfolio_meta["report_scope"] = "portfolio_all_sheets"
-        results["portfolio_report"] = analyze_dataframe(df.copy(), portfolio_meta)
-
-    # Per-artist reports (best split: sheet column you already have)
-    if mode in {"per_artist", "both"}:
-        per_artist = []
-        split_col = "_source_sheet" if "_source_sheet" in df.columns else "artist_name"
-
-        for key, sub in df.groupby(split_col):
-            sub = sub.copy()
-            artist_meta = dict(load_meta)
-            artist_meta["report_scope"] = "single_artist"
-            artist_meta["artist_key"] = str(key)
-            artist_meta["sheet"] = str(key) if split_col == "_source_sheet" else artist_meta.get("sheet")
-
-            per_artist.append({
-                "artist_key": str(key),
-                "report": analyze_dataframe(sub, artist_meta),
-            })
-
-        results["artist_reports"] = per_artist
-
-    return results
 
 
 def write_report_json(report: Dict[str, Any], out_path: str) -> None:
@@ -2237,40 +2321,17 @@ def build_risk_summary(report: Dict[str, Any]) -> str:
     labels = [mapping.get(c, c) for c in cats]
     return "Risk Summary: " + "; ".join(labels) + "."
 
-
-def generate_executive_docx(report: Dict[str, Any]) -> str:
-    doc = Document()
-
-    from pathlib import Path
-
-    # Identify this unit clearly (for title + filename)
-    inp = report.get("input", {}) or {}
-
-    artist_name = (
-        inp.get("artist_name")
-        or inp.get("artist_key")
-        or inp.get("sheet")
-        or inp.get("zip_member")
-        or Path(inp.get("source_path", "")).stem
-        or "Unknown_Unit"
-    )
-
-    normal = doc.styles["Normal"]
-    normal.font.name = "Calibri"
-    normal.font.size = Pt(11)
-
-    doc.styles["Heading 1"].font.name = "Calibri"
-    doc.styles["Heading 1"].font.size = Pt(22)
-    doc.styles["Heading 2"].font.name = "Calibri"
-    doc.styles["Heading 2"].font.size = Pt(14)
-    doc.styles["Heading 3"].font.name = "Calibri"
-    doc.styles["Heading 3"].font.size = Pt(12)
-
 # ============================================================
 # EXECUTIVE DOCX (PER UNIT)
 # ============================================================
 
 def generate_executive_docx(report: Dict[str, Any]) -> str:
+    """
+    Diagnostic-style executive DOCX (BM-friendly).
+    Uses BOTH unit-level signals and package-level intelligence (coverage + cross-stream diagnostics).
+    """
+    from pathlib import Path
+    from datetime import datetime
     from docx import Document
     from docx.shared import Pt, Inches
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -2279,8 +2340,7 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
 
     doc = Document()
 
-    # ---------- Helper functions (must stay INSIDE this function) ----------
-
+    # ---------- Helpers (inside function) ----------
     def set_cell_shading(cell, fill="F3F4F6"):
         tcPr = cell._tc.get_or_add_tcPr()
         shd = OxmlElement("w:shd")
@@ -2304,8 +2364,28 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
             set_cell_shading(c, header_fill)
             bold_cell(c, size=10)
 
-    # ---------- Metadata ----------
+        # zebra striping (optional)
+        if zebra and len(table.rows) > 1:
+            for ridx, r in enumerate(table.rows[1:], start=1):
+                if ridx % 2 == 0:
+                    for c in r.cells:
+                        set_cell_shading(c, "F6F7F9")
 
+    def add_divider():
+        p = doc.add_paragraph("—" * 28)
+        p.paragraph_format.space_before = Pt(6)
+        p.paragraph_format.space_after = Pt(10)
+
+    def add_kv(label: str, value: str):
+        p = doc.add_paragraph()
+        r = p.add_run(f"{label}: ")
+        r.bold = True
+        p.add_run(str(value))
+
+    def bullet(text: str):
+        doc.add_paragraph(str(text), style="List Bullet")
+
+    # ---------- Metadata ----------
     local_now = datetime.now()
     display_date = local_now.strftime("%B %d, %Y")
     filename_date = local_now.strftime("%Y-%m")
@@ -2313,64 +2393,207 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
     inp = report.get("input", {}) or {}
 
     source_path = inp.get("source_path", "") or ""
-    base_slug = Path(source_path).stem.replace(" ", "_") if source_path else "Unknown_Source"
+    base_slug = Path(source_path).stem.replace(" ", "_") if source_path else "Upload"
 
     sheet = inp.get("sheet")
     zip_member = inp.get("zip_member")
     artist_key = inp.get("artist_key")
 
-    parts = [base_slug]
+    # Unit name (for title)
+    unit_name = (
+        inp.get("artist_name")
+        or inp.get("artist_key")
+        or inp.get("sheet")
+        or inp.get("zip_member")
+        or Path(inp.get("source_path", "")).stem
+        or "Unknown_Unit"
+    )
 
-    # Prefer explicit identity fields when present
+    # Filename slug (avoid collisions)
+    parts = [base_slug]
     if zip_member:
         parts.append(Path(zip_member).stem.replace(" ", "_"))
     if sheet:
         parts.append(str(sheet).replace(" ", "_"))
     if artist_key and str(artist_key) not in parts:
         parts.append(str(artist_key).replace(" ", "_"))
-
-    # fallback if none of the above existed
     unit_slug = "_".join([p for p in parts if p]) or "Unit"
 
     filename = f"RI_Report_{unit_slug}_{filename_date}.docx"
 
-    # ---------- Title ----------
+    # Package intelligence (cross-reference)
+    pkg_ctx = report.get("package_context", {}) or {}
+    pkg_cov = pkg_ctx.get("package_coverage", {}) or {}
+    cross = pkg_ctx.get("cross_stream_diagnostics", {}) or {}
 
-    title = doc.add_heading("Royalty Intelligence", level=1)
+    # ---------- Title ----------
+    title = doc.add_heading("Royalty Intelligence — Diagnostic Report", level=1)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    inp = report.get("input", {}) or {}
-    artist_name = (
-            inp.get("artist_name")
-            or inp.get("artist_key")
-            or inp.get("sheet")
-            or inp.get("zip_member")
-            or Path(inp.get("source_path", "")).stem
-            or "Unknown_Unit"
-    )
-    sub = doc.add_paragraph(artist_name)
+    sub = doc.add_paragraph(str(unit_name))
     sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    doc.add_paragraph(f"Report Date: {display_date}")
+    date_para = doc.add_paragraph(f"Report Date: {display_date}")
+    date_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    # ---------- Simple Summary ----------
+    doc.add_paragraph("")
 
-    total_amount = float(report.get("summary", {}).get("total_amount", 0.0) or 0.0)
-    doc.add_paragraph(f"Total Revenue Reported: ${total_amount:,.2f}")
+    # ---------- 1) Executive Summary ----------
+    doc.add_heading("1) Executive Summary", level=2)
 
-    # ---------- Findings ----------
+    summ = report.get("summary", {}) or {}
+    statement_type = summ.get("statement_type", "Unknown")
+    statement_family = summ.get("statement_family", "UNKNOWN")
+    total_amount = float(summ.get("total_amount", 0.0) or 0.0)
+    total_rows = summ.get("total_rows", None)
+
+    add_kv("Statement type", statement_type)
+    add_kv("Statement family", statement_family)
+    add_kv("Rows analyzed", total_rows if total_rows is not None else "Unknown")
+    add_kv("Revenue in this upload", f"${total_amount:,.2f}")
+
+    # Package coverage cross-reference
+    present = pkg_cov.get("families_present", {}) or {}
+    missing = pkg_cov.get("missing_families", []) or []
+    if present:
+        add_kv("Coverage present in package", ", ".join([f"{k}({v})" for k, v in present.items()]))
+    if missing:
+        add_kv("Likely missing streams (package)", ", ".join(missing))
+
+    # Top cross-stream signals
+    cs_signals = cross.get("signals", []) or []
+    if cs_signals:
+        doc.add_paragraph("Package-level intelligence flagged:")
+        for s in cs_signals[:2]:
+            bullet(s.get("summary") or "")
+
+    add_divider()
+
+    # ---------- 2) Data Summary ----------
+    doc.add_heading("2) Data Summary", level=2)
 
     findings = report.get("findings", []) or []
+    add_kv("Flags detected", str(len(findings)))
+
+    # If you have drivers, show a small evidence table (BM-friendly)
+    drivers = report.get("top_revenue_drivers", []) or []
+    if drivers:
+        doc.add_paragraph("Top revenue drivers (from this upload):")
+
+        t = doc.add_table(rows=1, cols=4)
+        style_table(t)
+        hdr = t.rows[0].cells
+        hdr[0].text = "Track"
+        hdr[1].text = "Platform"
+        hdr[2].text = "Territory"
+        hdr[3].text = "Amount"
+
+        for d in drivers[:10]:
+            row = t.add_row().cells
+            row[0].text = str(d.get("track_title", "") or "")[:60]
+            row[1].text = str(d.get("platform_org", "") or "")[:30]
+            row[2].text = str(d.get("territory", "") or "")[:20]
+            row[3].text = f"${float(d.get('amount_usd', 0.0) or 0.0):,.2f}"
+
+    add_divider()
+
+    # ---------- 3) Methodology ----------
+    doc.add_heading("3) Methodology (How to read this)", level=2)
+    doc.add_paragraph(
+        "This report is a diagnostic prioritization layer. It flags patterns and likely gaps based on the "
+        "uploaded statements, their structure, and package-level cross-referencing. "
+        "Estimated ranges (when shown) are conservative and depend on registrations, splits, usage mix, "
+        "reporting windows, and contract terms."
+    )
+
+    add_divider()
+
+    # ---------- 4) Ranked Recovery Opportunities ----------
+    doc.add_heading("4) Ranked Recovery Opportunities", level=2)
+
+    # Use unit prioritization if present; otherwise use implied package streams
+    ranges = report.get("estimated_contextual_ranges", []) or []
+    prios = report.get("prioritized_opportunities", []) or []
+    prio_map = {p.get("stream"): p for p in prios if p.get("stream")}
+
+    implied = cross.get("implied_streams", []) or []
+    opportunities = []
+
+    if ranges:
+        for item in ranges:
+            stream = item.get("stream")
+            if not stream:
+                continue
+            low = float((item.get("estimated_range_usd", {}) or {}).get("low", 0.0) or 0.0)
+            high = float((item.get("estimated_range_usd", {}) or {}).get("high", 0.0) or 0.0)
+            conf = item.get("confidence", "Unknown")
+            rank = (prio_map.get(stream, {}) or {}).get("priority_rank", 99)
+            opportunities.append({
+                "rank": rank,
+                "stream": stream,
+                "range": f"${low:,.0f} – ${high:,.0f}" if (low or high) else "Range not available",
+                "confidence": conf,
+            })
+        opportunities.sort(key=lambda x: x["rank"])
+    else:
+        for idx, imp in enumerate(implied, start=1):
+            opportunities.append({
+                "rank": idx,
+                "stream": imp.get("stream"),
+                "range": "Depends on registrations/splits",
+                "confidence": f"Implied (p={imp.get('probability')})",
+            })
+
+    if not opportunities:
+        doc.add_paragraph("No ranked opportunities could be generated from the current data.")
+    else:
+        for i, opp in enumerate(opportunities[:4], start=1):
+            doc.add_paragraph(f"{i}. {opp.get('stream')}", style=None)
+            bullet(f"Estimated range: {opp.get('range')}")
+            bullet(f"Confidence: {opp.get('confidence')}")
+
+            # Try to attach a relevant recommended action from cross-stream signals
+            rec = None
+            for s in cs_signals:
+                if (s.get("recommended_action") or "") and (opp.get("stream") or ""):
+                    if opp["stream"] in (s.get("summary") or "") or opp["stream"] in (s.get("recommended_action") or ""):
+                        rec = s.get("recommended_action")
+                        break
+
+            if rec:
+                p = doc.add_paragraph()
+                r = p.add_run("Recommended next step: ")
+                r.bold = True
+                p.add_run(str(rec))
+
+            add_divider()
+
+    # ---------- 5) Manager Action Plan ----------
+    doc.add_heading("5) Manager Action Plan (Next 7–14 days)", level=2)
+
+    actions = cross.get("recommended_actions", []) or []
+    if actions:
+        for a in actions[:6]:
+            bullet(a)
+    else:
+        bullet("Upload missing statements for the same reporting window (MLC / PRO / Neighboring Rights).")
+        bullet("Verify work registrations + matching (titles, writers, IPI/CAE, ISRC/ISWC).")
+        bullet("Re-run diagnostics using line-item exports for deeper validation.")
+
+    add_divider()
+
+    # ---------- Flags Detected ----------
+    doc.add_heading("Flags Detected (From This Upload)", level=2)
 
     if findings:
-        doc.add_heading("Findings", level=2)
-        for f in findings:
-            doc.add_paragraph(f"• {f.get('summary')}", style="List Bullet")
+        for f in findings[:12]:
+            bullet(f.get("summary") or f.get("category") or "Finding")
     else:
-        doc.add_paragraph("No findings detected.")
+        bullet("No anomalies were detected by the current rule set for this upload.")
 
     doc.save(filename)
     return filename
+
 
 
 # ============================================================
@@ -2378,30 +2601,137 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
 # ============================================================
 
 def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
+    """
+    Generates a single executive summary DOCX for the entire uploaded package,
+    including estimated opportunity ranges aggregated across units.
+    """
     from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from pathlib import Path
+    from datetime import datetime
 
     package_meta = package_report.get("package_meta", {}) or {}
     rollup = package_report.get("workbook_rollup", {}) or {}
     coverage = package_report.get("package_coverage", {}) or {}
+    unit_reports = package_report.get("unit_reports", []) or []
     units = rollup.get("units", []) or []
+
+    cross = package_report.get("cross_stream_diagnostics", {}) or {}
+    cross_signals = cross.get("signals", []) or []
 
     doc = Document()
 
-    doc.add_heading("Royalty Intelligence — Package Executive Report", level=1)
+    # -------------------------
+    # Helpers
+    # -------------------------
+    def money(x: float) -> str:
+        try:
+            return f"${float(x):,.0f}"
+        except Exception:
+            return "$0"
 
-    source_name = package_meta.get("source_path", "Package")
-    doc.add_paragraph(f"Source: {source_name}")
-    doc.add_paragraph(f"Units analyzed: {rollup.get('unit_count', 0)}")
-
-    total_revenue = sum([u.get("total_amount", 0) or 0 for u in units])
-    doc.add_paragraph(f"Total reported revenue (all units): ${total_revenue:,.2f}")
-
-    # Coverage
-    doc.add_heading("Statement Coverage", level=2)
-
+    # -------------------------
+    # Coverage vars (define ONCE)
+    # -------------------------
     present = coverage.get("families_present", {}) or {}
     missing = coverage.get("missing_families", []) or []
     recs = coverage.get("recommended_next_uploads", []) or []
+
+    # -------------------------
+    # Aggregate estimated opportunity ranges across units (define ONCE)
+    # -------------------------
+    # unit format:
+    # r["estimated_contextual_ranges"] = [{"stream": "...", "estimated_range_usd": {"low":..., "high":...}, "confidence": "..."}]
+    agg: Dict[str, Dict[str, Any]] = {}  # stream -> {"low": sum, "high": sum, "conf_counts": {...}}
+
+    for r in unit_reports:
+        for item in (r.get("estimated_contextual_ranges", []) or []):
+            stream = item.get("stream") or "Unknown"
+            rng = item.get("estimated_range_usd", {}) or {}
+            low = float(rng.get("low", 0) or 0)
+            high = float(rng.get("high", 0) or 0)
+            conf = str(item.get("confidence") or "Unknown").strip()
+
+            if stream not in agg:
+                agg[stream] = {"low": 0.0, "high": 0.0, "conf_counts": {}}
+
+            agg[stream]["low"] += low
+            agg[stream]["high"] += high
+            agg[stream]["conf_counts"][conf] = agg[stream]["conf_counts"].get(conf, 0) + 1
+
+    # -------------------------
+    # Title + Header
+    # -------------------------
+    title = doc.add_heading("Royalty Intelligence — Package Executive Report", level=1)
+    title.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    source_name = package_meta.get("source_path", "Package")
+    doc.add_paragraph(f"Source: {source_name}")
+    doc.add_paragraph(f"Units analyzed: {rollup.get('unit_count', len(units))}")
+
+    # Total revenue across units
+    total_revenue = float(sum(float(u.get("total_amount", 0) or 0) for u in units))
+    doc.add_paragraph(f"Total reported revenue (all units): {money(total_revenue)}")
+    doc.add_paragraph("")
+
+    # =====================================================
+    # EXECUTIVE SNAPSHOT
+    # =====================================================
+    doc.add_heading("Executive Snapshot", level=2)
+
+    total_low = float(sum(float(v.get("low", 0) or 0) for v in agg.values()))
+    total_high = float(sum(float(v.get("high", 0) or 0) for v in agg.values()))
+
+    # Structural risk scoring
+    risk_score = 0
+    if missing:
+        risk_score += 2
+
+    for s in (cross_signals or []):
+        sev = str(s.get("severity") or "Medium").strip()
+        if sev == "High":
+            risk_score += 2
+        elif sev == "Medium":
+            risk_score += 1
+
+    if risk_score >= 5:
+        structural_risk = "High"
+    elif risk_score >= 2:
+        structural_risk = "Medium"
+    else:
+        structural_risk = "Low"
+
+    # Highest implied stream (by agg high)
+    top_stream = None
+    if agg:
+        ranked_streams = sorted(agg.items(), key=lambda kv: float(kv[1].get("high", 0) or 0), reverse=True)
+        top_stream = ranked_streams[0][0]
+
+    # Immediate action (strongest severity signal)
+    immediate_action = None
+    if cross_signals:
+        sev_rank = {"High": 3, "Medium": 2, "Low": 1}
+        strongest = sorted(
+            cross_signals,
+            key=lambda x: sev_rank.get(str(x.get("severity") or "Medium").strip(), 2),
+            reverse=True
+        )[0]
+        immediate_action = strongest.get("recommended_action")
+
+    doc.add_paragraph(f"• Implied Missing Revenue Range: {money(total_low)} – {money(total_high)}")
+    doc.add_paragraph(f"• Structural Risk Level: {structural_risk}")
+
+    if top_stream:
+        doc.add_paragraph(f"• Highest Priority Stream: {top_stream}")
+    if immediate_action:
+        doc.add_paragraph(f"• Immediate Action: {immediate_action}")
+
+    doc.add_paragraph("")
+
+    # -------------------------
+    # Coverage Summary
+    # -------------------------
+    doc.add_heading("Statement Coverage", level=2)
 
     if present:
         doc.add_paragraph("Coverage present:")
@@ -2418,27 +2748,85 @@ def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
         for r in recs:
             doc.add_paragraph(f"- {r}", style="List Bullet")
 
+    doc.add_paragraph("")
+
+    # -------------------------
+    # Package Estimated Opportunity Ranges
+    # -------------------------
+    doc.add_heading("Estimated Opportunity Ranges (Package)", level=2)
+
+    if not agg:
+        doc.add_paragraph(
+            "No package-level ranges are available yet. "
+            "This typically means unit reports did not include estimated_contextual_ranges."
+        )
+    else:
+        ranked = sorted(agg.items(), key=lambda kv: float(kv[1].get("high", 0) or 0), reverse=True)
+
+        for stream, v in ranked[:6]:
+            conf_counts = v.get("conf_counts", {}) or {}
+            conf_mode = (
+                sorted(conf_counts.items(), key=lambda kv2: kv2[1], reverse=True)[0][0]
+                if conf_counts else "Unknown"
+            )
+
+            doc.add_paragraph(
+                f"- {stream}: {money(v['low'])} – {money(v['high'])} (Confidence: {conf_mode})",
+                style="List Bullet",
+            )
+
+        doc.add_paragraph(
+            "Note: Ranges are conservative and depend on registrations, splits, usage mix, reporting windows, and contract terms."
+        )
+
+    doc.add_paragraph("")
+
+    # -------------------------
     # Top Revenue Units
+    # -------------------------
     doc.add_heading("Top Revenue Units", level=2)
 
-    top_units = sorted(units, key=lambda x: x.get("total_amount", 0) or 0, reverse=True)[:3]
-
+    top_units = sorted(units, key=lambda x: x.get("total_amount", 0) or 0, reverse=True)[:5]
     for u in top_units:
         doc.add_paragraph(
-            f"- {u.get('unit_name')}: ${u.get('total_amount', 0):,.2f}",
+            f"- {u.get('unit_name')}: {money(u.get('total_amount', 0) or 0)}",
             style="List Bullet"
         )
 
-    # High Severity Findings
-    doc.add_heading("High Risk Flags", level=2)
+    doc.add_paragraph("")
 
-    high_flags = []
-    for r in package_report.get("unit_reports", []) or []:
-        for f in r.get("findings", []) or []:
-            if f.get("severity") == "High":
-                high_flags.append(f.get("summary"))
+    # -------------------------
+    # Cross-stream intelligence signals (if present)
+    # -------------------------
+    if cross_signals:
+        doc.add_heading("Package-Level Intelligence Signals", level=2)
 
-    high_flags = list(set(high_flags))[:5]
+        for s in cross_signals[:6]:
+            summ = str(s.get("summary") or "").strip()
+            sev = str(s.get("severity") or "Medium").strip()
+            conf = str(s.get("confidence") or "Medium").strip()
+            rec = str(s.get("recommended_action") or "").strip()
+
+            doc.add_paragraph(f"- {summ} (Impact: {sev} | Certainty: {conf})", style="List Bullet")
+            if rec:
+                doc.add_paragraph(f"  Start here: {rec}")
+
+        doc.add_paragraph("")
+
+    # -------------------------
+    # High severity findings across units
+    # -------------------------
+    doc.add_heading("High Risk Flags (Across Units)", level=2)
+
+    high_flags: List[str] = []
+    for r in unit_reports:
+        for f in (r.get("findings", []) or []):
+            sev_val = f.get("severity")
+            sev = str(sev_val).strip() if sev_val is not None else ""
+            if sev == "High":
+                high_flags.append(str(f.get("summary") or "").strip())
+
+    high_flags = [x for x in dict.fromkeys(high_flags) if x][:8]
 
     if high_flags:
         for flag in high_flags:
@@ -2446,12 +2834,17 @@ def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
     else:
         doc.add_paragraph("No high severity findings detected.")
 
+    # -------------------------
+    # Save
+    # -------------------------
     filename_date = datetime.now().strftime("%Y-%m")
-    base_slug = Path(source_name).stem.replace(" ", "_")
+    base_slug = Path(str(source_name)).stem.replace(" ", "_")
     filename = f"RI_Master_Package_Report_{base_slug}_{filename_date}.docx"
 
     doc.save(filename)
     return filename
+
+
 
 
 # ============================================================
@@ -2460,7 +2853,6 @@ def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
 
 if __name__ == "__main__":
     import argparse
-    from pathlib import Path
 
     parser = argparse.ArgumentParser(description="Royalty Intelligence - Local Demo Runner")
     parser.add_argument("input", help="Path to file (.csv/.xlsx/.zip)")
@@ -2471,14 +2863,57 @@ if __name__ == "__main__":
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # Run package analysis
+    # 1) Run package analysis (returns package_report)
     package_report = analyze_package(args.input, verbose=args.verbose)
 
-    # Save JSON
+    # 2) Ensure cross-stream diagnostics exist (analyze_package should already set it)
+    cross_stream = package_report.get("cross_stream_diagnostics") or compute_cross_stream_diagnostics(package_report)
+    package_report["cross_stream_diagnostics"] = cross_stream
+
+    # 3) Attach package context to each unit report (so per-unit DOCX can reference it)
+    unit_reports = package_report.get("unit_reports", []) or []
+    package_coverage = package_report.get("package_coverage", {}) or {}
+
+    for r in unit_reports:
+        r["package_context"] = {
+            "package_coverage": package_coverage,
+            "cross_stream_diagnostics": cross_stream,
+        }
+
+    # 4) Generate per-unit DOCX files
+    docx_files: List[str] = []
+    master_docx: Optional[str] = None
+
+    if not unit_reports:
+        print("No analyzable units found in the uploaded file.")
+    else:
+        for r in unit_reports:
+            docx_filename = generate_executive_docx(r)
+            p = Path(docx_filename)
+
+            # move into outdir
+            try:
+                p.replace(outdir / p.name)
+                docx_filename = str(outdir / p.name)
+            except Exception:
+                pass
+
+            docx_files.append(docx_filename)
+
+        # 5) Generate master package DOCX
+        master_docx = generate_master_package_docx(package_report)
+        mp = Path(master_docx)
+        try:
+            mp.replace(outdir / mp.name)
+            master_docx = str(outdir / mp.name)
+        except Exception:
+            pass
+
+    # 6) Save JSON ONCE
     json_path = outdir / "royalty_intelligence_report.json"
     write_report_json(package_report, str(json_path))
 
-    # Print clean demo summary
+    # 7) Print clean demo summary ONCE
     rollup = package_report.get("workbook_rollup", {}) or {}
     units = rollup.get("units", []) or []
     coverage = package_report.get("package_coverage", {}) or {}
@@ -2487,12 +2922,7 @@ if __name__ == "__main__":
     print(f"Input: {args.input}")
     print(f"Units analyzed: {rollup.get('unit_count', len(units))}")
 
-    top_units = sorted(
-        units,
-        key=lambda x: x.get("total_amount", 0) or 0,
-        reverse=True
-    )[:5]
-
+    top_units = sorted(units, key=lambda x: x.get("total_amount", 0) or 0, reverse=True)[:5]
     print("\nTop units by reported revenue:")
     for u in top_units:
         name = u.get("unit_name") or u.get("sheet") or u.get("zip_member") or "Unit"
@@ -2515,43 +2945,18 @@ if __name__ == "__main__":
         for r in recs[:6]:
             print(f" - {r}")
 
-    # --- Generate a DOCX per unit (real-world expectation) ---
-    unit_reports = package_report.get("unit_reports", []) or []
-    master_docx = None
+    cs_signals = (cross_stream.get("signals") or [])[:6]
+    if cs_signals:
+        print("\nCross-stream diagnostic signals:")
+        for s in cs_signals:
+            sev = s.get("severity", "Unknown")
+            summ = s.get("summary", "")
+            print(f" - [{sev}] {summ}")
 
-    if not unit_reports:
-        print("\nNo analyzable units found in the uploaded file.")
-    else:
-        for r in unit_reports:
-            inp = r.get("input", {}) or {}
-            unit_name = (
-                inp.get("artist_name")
-                or inp.get("artist_key")
-                or inp.get("sheet")
-                or inp.get("zip_member")
-                or "Unit"
-            )
-
-            docx_filename = generate_executive_docx(r)
-
-            # move to reports folder
-            p = Path(docx_filename)
-            try:
-                p.replace(outdir / p.name)
-                docx_filename = str(outdir / p.name)
-            except Exception:
-                pass
-
-            print(f"\nUnit report: {unit_name}: {docx_filename}")
-
-        # Generate master package DOCX (after units)
-        master_docx = generate_master_package_docx(package_report)
-        mp = Path(master_docx)
-        try:
-            mp.replace(outdir / mp.name)
-            master_docx = str(outdir / mp.name)
-        except Exception:
-            pass
+    if docx_files:
+        print("\nUnit reports:")
+        for p in docx_files:
+            print(f" - {p}")
 
     print(f"\nMaster package report: {master_docx if master_docx else '(not generated)'}")
     print(f"JSON report: {json_path}\n")
