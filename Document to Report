@@ -699,10 +699,11 @@ def check_revenue_concentration(df: pd.DataFrame, amount_col: str) -> List[Findi
 
             ev = [EvidenceRow(row_index=0, fields={"platform_org": k, "revenue": float(v)}) for k, v in top_plat.items()]
 
+            top_platform_name = str(top_plat.index[0])
             summary = (
-                f"All reported revenue comes from {top_plat.index[0]}."
+                f"All reported revenue comes from {top_platform_name}."
                 if len(top_plat) == 1
-                else f"Top platform contributes {top_share:.0%} of total revenue (top 5 shown)."
+                else f"Platform concentration: {top_platform_name} contributes {top_share:.0%} of total revenue."
             )
 
             findings.append(
@@ -735,10 +736,11 @@ def check_revenue_concentration(df: pd.DataFrame, amount_col: str) -> List[Findi
 
             ev = [EvidenceRow(row_index=0, fields={"territory": k, "revenue": float(v)}) for k, v in top_terr.items()]
 
+            top_territory_name = str(top_terr.index[0])
             summary = (
-                f"All reported revenue comes from {top_terr.index[0]}."
+                f"All reported revenue comes from {top_territory_name}."
                 if len(top_terr) == 1
-                else f"Top territory contributes {top_share:.0%} of total revenue (top 5 shown)."
+                else f"Territory concentration: {top_territory_name} contributes {top_share:.0%} of total revenue."
             )
 
             findings.append(
@@ -1476,17 +1478,15 @@ def classify_behavior(series: np.ndarray) -> Dict[str, Any]:
 
 
 def compute_revenue_risk_level(trend: Dict[str, Any] | None) -> Dict[str, Any]:
-    trend = trend or {}
-    signals = trend.get("signals", []) or []
     """
     Converts trend_intelligence signals into a single user-friendly takeaway.
     """
+    trend = trend or {}
     signals = trend.get("signals", []) or []
 
     drivers: List[str] = []
     level = "Low"
 
-    # If any behavior/trajectory says declining OR severity is high, escalate
     for s in signals:
         st = (s.get("signal_type") or "").strip()
         direction = (s.get("direction") or "").strip().lower()
@@ -1494,17 +1494,17 @@ def compute_revenue_risk_level(trend: Dict[str, Any] | None) -> Dict[str, Any]:
 
         if st == "REVENUE_TRAJECTORY" and direction == "decreasing":
             drivers.append("Revenue trending downward")
-            level = "Moderate" if level == "Low" else level
+            if level == "Low":
+                level = "Moderate"
 
         if st == "PORTFOLIO_BEHAVIOR" and direction == "volatile":
             drivers.append("Unstable revenue behavior (volatility)")
-            level = "Moderate" if level == "Low" else level
+            if level == "Low":
+                level = "Moderate"
 
-        # If we ever label something High severity, bump overall level
         if sev == "High":
             level = "High"
 
-    # Meaning text (what a manager understands instantly)
     meaning_map = {
         "Low": (
             "Revenue looks relatively stable across the months analyzed. "
@@ -1520,7 +1520,6 @@ def compute_revenue_risk_level(trend: Dict[str, Any] | None) -> Dict[str, Any]:
         ),
     }
 
-    # Action text (where to start)
     action_map = {
         "Low": (
             "Confirm registrations are complete (MLC/PROs) and ensure all expected platforms are represented. "
@@ -1536,7 +1535,6 @@ def compute_revenue_risk_level(trend: Dict[str, Any] | None) -> Dict[str, Any]:
         ),
     }
 
-    # De-dupe driver list but keep order
     drivers = list(dict.fromkeys([d for d in drivers if d]))
 
     return {
@@ -1545,6 +1543,7 @@ def compute_revenue_risk_level(trend: Dict[str, Any] | None) -> Dict[str, Any]:
         "key_drivers": drivers,
         "recommended_start": action_map[level],
     }
+
 
 
 
@@ -1905,17 +1904,11 @@ def analyze_dataframe(df: pd.DataFrame, load_meta: dict, verbose: bool = False) 
         findings += check_rate_math(df, amount_col)
 
     else:
-        findings.append(
-            Finding(
-                id=stable_id("ambiguous_statement"),
-                category="Statement type unclear",
-                severity="Low",
-                confidence=0.6,
-                summary="This file does not clearly match a summary or line-item royalty statement format.",
-                recommended_action="Export a detailed (line-item) royalty report if available, ideally including track/ISRC and earnings columns.",
-                evidence=[],
-            )
-        )
+        # ✅ Mixed-format export (ambiguous): do not add a Finding.
+        # Run only “safe” checks that apply across formats.
+        findings += check_negative_amounts(df, amount_col)
+        findings += check_revenue_concentration(df, amount_col)
+        findings += check_suspicious_territories(df)
 
     total_rows = int(len(df))
     total_amount = float(df[amount_col].fillna(0).sum())
@@ -2333,14 +2326,14 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
     from pathlib import Path
     from datetime import datetime
     from docx import Document
-    from docx.shared import Pt, Inches
+    from docx.shared import Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
 
     doc = Document()
 
-    # ---------- Helpers (inside function) ----------
+    # ---------- Helpers ----------
     def set_cell_shading(cell, fill="F3F4F6"):
         tcPr = cell._tc.get_or_add_tcPr()
         shd = OxmlElement("w:shd")
@@ -2364,19 +2357,18 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
             set_cell_shading(c, header_fill)
             bold_cell(c, size=10)
 
-        # zebra striping (optional)
         if zebra and len(table.rows) > 1:
             for ridx, r in enumerate(table.rows[1:], start=1):
                 if ridx % 2 == 0:
                     for c in r.cells:
                         set_cell_shading(c, "F6F7F9")
 
-    def add_divider():
-        p = doc.add_paragraph("—" * 28)
+    def dashed_divider():
+        p = doc.add_paragraph("-" * 60)
         p.paragraph_format.space_before = Pt(6)
         p.paragraph_format.space_after = Pt(10)
 
-    def add_kv(label: str, value: str):
+    def add_kv(label: str, value: Any):
         p = doc.add_paragraph()
         r = p.add_run(f"{label}: ")
         r.bold = True
@@ -2385,43 +2377,59 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
     def bullet(text: str):
         doc.add_paragraph(str(text), style="List Bullet")
 
+    def _clean_unit_label(inp: dict) -> str:
+        """
+        Prefer human titles over file paths.
+        Examples:
+          zip_member: PinkPantheress_Demo_Package_Q4_2025/WMG_LabelMaster_...csv
+          -> WMG_LabelMaster_PinkPantheress_Q4_2025
+        """
+        if not inp:
+            return "Uploaded Statement"
+
+        # strongest: explicit
+        if inp.get("artist_name"):
+            return str(inp["artist_name"]).strip()
+
+        sheet = inp.get("sheet")
+        if sheet:
+            return str(sheet).strip()
+
+        zm = inp.get("zip_member")
+        if zm:
+            # take filename stem only
+            return Path(str(zm)).stem
+
+        sp = inp.get("source_path")
+        if sp:
+            return Path(str(sp)).stem
+
+        return "Uploaded Statement"
+
     # ---------- Metadata ----------
     local_now = datetime.now()
     display_date = local_now.strftime("%B %d, %Y")
     filename_date = local_now.strftime("%Y-%m")
 
     inp = report.get("input", {}) or {}
+    unit_label = _clean_unit_label(inp)
 
+    # Filename slug (avoid collisions)
     source_path = inp.get("source_path", "") or ""
     base_slug = Path(source_path).stem.replace(" ", "_") if source_path else "Upload"
 
-    sheet = inp.get("sheet")
-    zip_member = inp.get("zip_member")
-    artist_key = inp.get("artist_key")
-
-    # Unit name (for title)
-    unit_name = (
-        inp.get("artist_name")
-        or inp.get("artist_key")
-        or inp.get("sheet")
-        or inp.get("zip_member")
-        or Path(inp.get("source_path", "")).stem
-        or "Unknown_Unit"
-    )
-
-    # Filename slug (avoid collisions)
     parts = [base_slug]
+    zip_member = inp.get("zip_member")
+    sheet = inp.get("sheet")
     if zip_member:
-        parts.append(Path(zip_member).stem.replace(" ", "_"))
+        parts.append(Path(str(zip_member)).stem.replace(" ", "_"))
     if sheet:
         parts.append(str(sheet).replace(" ", "_"))
-    if artist_key and str(artist_key) not in parts:
-        parts.append(str(artist_key).replace(" ", "_"))
     unit_slug = "_".join([p for p in parts if p]) or "Unit"
 
     filename = f"RI_Report_{unit_slug}_{filename_date}.docx"
 
-    # Package intelligence (cross-reference)
+    # Package intelligence
     pkg_ctx = report.get("package_context", {}) or {}
     pkg_cov = pkg_ctx.get("package_coverage", {}) or {}
     cross = pkg_ctx.get("cross_stream_diagnostics", {}) or {}
@@ -2430,7 +2438,7 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
     title = doc.add_heading("Royalty Intelligence — Diagnostic Report", level=1)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    sub = doc.add_paragraph(str(unit_name))
+    sub = doc.add_paragraph(str(unit_label))
     sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     date_para = doc.add_paragraph(f"Report Date: {display_date}")
@@ -2442,12 +2450,15 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
     doc.add_heading("1) Executive Summary", level=2)
 
     summ = report.get("summary", {}) or {}
-    statement_type = summ.get("statement_type", "Unknown")
-    statement_family = summ.get("statement_family", "UNKNOWN")
+    statement_type = str(summ.get("statement_type", "Unknown")).strip()
+    statement_family = str(summ.get("statement_family", "UNKNOWN")).strip()
     total_amount = float(summ.get("total_amount", 0.0) or 0.0)
     total_rows = summ.get("total_rows", None)
 
-    add_kv("Statement type", statement_type)
+    # ✅ Hide statement type; only show structure label if ambiguous
+    if statement_type == "ambiguous":
+        add_kv("Statement structure", "Mixed-format export")
+
     add_kv("Statement family", statement_family)
     add_kv("Rows analyzed", total_rows if total_rows is not None else "Unknown")
     add_kv("Revenue in this upload", f"${total_amount:,.2f}")
@@ -2455,27 +2466,30 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
     # Package coverage cross-reference
     present = pkg_cov.get("families_present", {}) or {}
     missing = pkg_cov.get("missing_families", []) or []
+
     if present:
-        add_kv("Coverage present in package", ", ".join([f"{k}({v})" for k, v in present.items()]))
+        add_kv(
+            "Coverage present in package",
+            ", ".join([f"{k}({v})" for k, v in present.items()])
+        )
     if missing:
         add_kv("Likely missing streams (package)", ", ".join(missing))
 
-    # Top cross-stream signals
+    # Top cross-stream signals (up to 2)
     cs_signals = cross.get("signals", []) or []
     if cs_signals:
         doc.add_paragraph("Package-level intelligence flagged:")
         for s in cs_signals[:2]:
             bullet(s.get("summary") or "")
 
-    add_divider()
+    dashed_divider()
 
     # ---------- 2) Data Summary ----------
     doc.add_heading("2) Data Summary", level=2)
 
     findings = report.get("findings", []) or []
-    add_kv("Flags detected", str(len(findings)))
+    add_kv("Portfolio risk signals", str(len(findings)))
 
-    # If you have drivers, show a small evidence table (BM-friendly)
     drivers = report.get("top_revenue_drivers", []) or []
     if drivers:
         doc.add_paragraph("Top revenue drivers (from this upload):")
@@ -2495,7 +2509,7 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
             row[2].text = str(d.get("territory", "") or "")[:20]
             row[3].text = f"${float(d.get('amount_usd', 0.0) or 0.0):,.2f}"
 
-    add_divider()
+    dashed_divider()
 
     # ---------- 3) Methodology ----------
     doc.add_heading("3) Methodology (How to read this)", level=2)
@@ -2506,12 +2520,11 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
         "reporting windows, and contract terms."
     )
 
-    add_divider()
+    dashed_divider()
 
     # ---------- 4) Ranked Recovery Opportunities ----------
     doc.add_heading("4) Ranked Recovery Opportunities", level=2)
 
-    # Use unit prioritization if present; otherwise use implied package streams
     ranges = report.get("estimated_contextual_ranges", []) or []
     prios = report.get("prioritized_opportunities", []) or []
     prio_map = {p.get("stream"): p for p in prios if p.get("stream")}
@@ -2551,45 +2564,41 @@ def generate_executive_docx(report: Dict[str, Any]) -> str:
             doc.add_paragraph(f"{i}. {opp.get('stream')}", style=None)
             bullet(f"Estimated range: {opp.get('range')}")
             bullet(f"Confidence: {opp.get('confidence')}")
-
-            # Try to attach a relevant recommended action from cross-stream signals
-            rec = None
-            for s in cs_signals:
-                if (s.get("recommended_action") or "") and (opp.get("stream") or ""):
-                    if opp["stream"] in (s.get("summary") or "") or opp["stream"] in (s.get("recommended_action") or ""):
-                        rec = s.get("recommended_action")
-                        break
-
-            if rec:
-                p = doc.add_paragraph()
-                r = p.add_run("Recommended next step: ")
-                r.bold = True
-                p.add_run(str(rec))
-
-            add_divider()
+            dashed_divider()
 
     # ---------- 5) Manager Action Plan ----------
     doc.add_heading("5) Manager Action Plan (Next 7–14 days)", level=2)
 
+    # ✅ Package-aware actions: do NOT tell them to upload MLC/PRO/NR if package already has them
     actions = cross.get("recommended_actions", []) or []
+
+    if missing:
+        # If package says missing families, emphasize those
+        bullet("Request/upload missing statement coverage for the SAME reporting window:")
+        for m in missing[:6]:
+            bullet(f"{m}")
+        dashed_divider()
+
     if actions:
         for a in actions[:6]:
             bullet(a)
     else:
-        bullet("Upload missing statements for the same reporting window (MLC / PRO / Neighboring Rights).")
-        bullet("Verify work registrations + matching (titles, writers, IPI/CAE, ISRC/ISWC).")
-        bullet("Re-run diagnostics using line-item exports for deeper validation.")
+        # fallback plan: no missing coverage & no cross-stream actions
+        bullet("Verify registrations and matches (works, writers, IPI/CAE, ISRC/ISWC) across the reporting window.")
+        bullet("Reconcile timing differences: some streams lag DSP statements by months (especially PRO/neighboring).")
+        bullet("If deeper validation is needed, request the most detailed export available (line-item where possible).")
 
-    add_divider()
+    dashed_divider()
 
     # ---------- Flags Detected ----------
-    doc.add_heading("Flags Detected (From This Upload)", level=2)
+    doc.add_heading("Portfolio Risk Signals (From This Upload)", level=2)
 
     if findings:
         for f in findings[:12]:
             bullet(f.get("summary") or f.get("category") or "Finding")
     else:
-        bullet("No anomalies were detected by the current rule set for this upload.")
+        # ✅ Calm executive language
+        doc.add_paragraph("No critical reporting gaps identified in uploaded statements.")
 
     doc.save(filename)
     return filename
@@ -2609,6 +2618,7 @@ def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from pathlib import Path
     from datetime import datetime
+    import re
 
     package_meta = package_report.get("package_meta", {}) or {}
     rollup = package_report.get("workbook_rollup", {}) or {}
@@ -2630,6 +2640,186 @@ def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
         except Exception:
             return "$0"
 
+    def dashed_divider():
+        # dashed line separator for readability
+        p = doc.add_paragraph("-" * 60)
+        p.paragraph_format.space_before = 6
+        p.paragraph_format.space_after = 10
+
+    def clean_filename(name: str) -> str:
+        # strip weird temp prefixes; keep it human
+        if not name:
+            return "Package"
+        base = Path(str(name)).name
+        return base
+
+    def pick_common_window(reports: list[dict]) -> str | None:
+        windows = {}
+        for r in reports or []:
+            w = ((r.get("trend_intelligence", {}) or {}).get("window_label") or "").strip()
+            if w:
+                windows[w] = windows.get(w, 0) + 1
+        if not windows:
+            return None
+        return sorted(windows.items(), key=lambda kv: kv[1], reverse=True)[0][0]
+
+    def infer_artist_label(reports: list[dict]) -> str:
+        """
+        If all unit reports share the same artist_name/artist_key, return it.
+        Otherwise infer from zip paths / filenames (folder structure).
+        If still ambiguous -> Multi-Artist Package.
+        If nothing reliable -> Executive Package.
+        """
+
+        def _is_bad_token(t: str) -> bool:
+            t = (t or "").strip()
+            if not t:
+                return True
+            # reject ultra-short or generic tokens that come from filenames
+            bad = {
+                "ri", "royalty", "report", "package", "demo",
+                "upload", "uploads",
+                "q4", "q3", "q2", "q1",
+                "wmg", "mlc", "pro", "prs"
+            }
+            if t.lower() in bad:
+                return True
+
+            t_low = t.lower()
+
+            # reject package-like slugs even if long
+            if t_low.startswith("ri_"):
+                return True
+
+            if any(x in t_low for x in [
+                "business_manager",
+                "multi_artist",
+                "demo_package",
+                "demo",
+                "executive",
+                "report",
+                "package",
+            ]):
+                return True
+
+            # Only reject ultra-short tokens of length 1–2
+            if len(t) < 3:
+                return True
+
+            return False
+
+        def _format_artist_list(names: list[str], max_names: int = 3) -> str:
+            names = [n.strip() for n in names if n and n.strip()]
+            if not names:
+                return "Executive Package"
+            names = sorted(dict.fromkeys(names))  # de-dupe, preserve order-ish
+            if len(names) == 1:
+                return names[0]
+            if len(names) <= max_names:
+                return " / ".join(names)
+            return f"{names[0]} / {names[1]} / {names[2]} +{len(names) - 3} more"
+
+        # 1) Strong signals: explicit meta
+        candidates = []
+        for r in reports or []:
+            inp = r.get("input", {}) or {}
+            a = (inp.get("artist_name") or inp.get("artist_key") or "").strip()
+            if a and not _is_bad_token(a):
+                candidates.append(a)
+
+        uniq = sorted(set(candidates))
+        if len(uniq) >= 1:
+            return _format_artist_list(uniq, max_names=3)
+
+        # 2) Fallback: infer from zip_member folder structure (preferred) then filenames
+        inferred = []
+        for r in reports or []:
+            inp = r.get("input", {}) or {}
+
+            zip_member = str(inp.get("zip_member") or "").strip()
+            sheet = str(inp.get("sheet") or "").strip()
+            source_path = str(inp.get("source_path") or "").strip()
+
+            # Prefer zip path folder name (most reliable for packages)
+            # In our demo zips the structure is:
+            #   <PACKAGE_FOLDER>/<ARTIST_FOLDER>/<FILE>
+            if zip_member and "/" in zip_member:
+                parts = [p for p in zip_member.split("/") if p.strip()]
+
+                # If we have at least 2 folders, the artist is usually the SECOND folder
+                if len(parts) >= 2:
+                    artist_folder = parts[1].strip()  # e.g., "DDG_Q4_2025"
+                    token = artist_folder.split("_Q", 1)[0].strip()  # -> "DDG"
+
+                    if token and not _is_bad_token(token):
+                        inferred.append(token)
+                        continue
+
+                # Fallback: if only one folder exists, try the first (rare)
+                first_folder = parts[0].strip()
+                token = first_folder.split("_Q", 1)[0].strip()
+                if token and not _is_bad_token(token):
+                    inferred.append(token)
+                    continue
+
+            # Next: filename stem
+            # IMPORTANT: do NOT include source_path here (it's usually the uploaded zip filename)
+            name_blob = " ".join([zip_member, sheet]).strip()
+            if not name_blob:
+                continue
+
+            base = Path(name_blob).stem
+
+            # Robust filename inference:
+            # Most demo files look like: <Prefix>_<MaybeSubType>_<ARTIST>_Q4_2025
+            # So: take the token immediately BEFORE the quarter marker (Q1/Q2/Q3/Q4)
+            tokens = [t for t in base.split("_") if t.strip()]
+            q_idx = None
+            for i, t in enumerate(tokens):
+                if t.upper() in {"Q1", "Q2", "Q3", "Q4"}:
+                    q_idx = i
+                    break
+
+            if q_idx is not None and q_idx >= 1:
+                token = tokens[q_idx - 1].strip()  # this is the artist
+                if token and not _is_bad_token(token):
+                    inferred.append(token)
+            else:
+                # fallback: first token
+                token = tokens[0].strip() if tokens else ""
+                if token and not _is_bad_token(token):
+                    inferred.append(token)
+
+        uniq_inf = sorted(set([x for x in inferred if x]))
+        if len(uniq_inf) >= 1:
+            return _format_artist_list(uniq_inf, max_names=3)
+
+        return "Executive Package"
+
+    def has_critical_reporting_gaps(reports: list[dict], pkg_cov: dict) -> bool:
+        """
+        Critical gaps = missing expected families OR any High severity structural categories.
+        """
+        missing = pkg_cov.get("missing_families", []) or []
+        if missing:
+            return True
+
+        critical_categories = {
+            "Missing reporting periods",
+            "Coverage gap risk",
+            "Territory concentration risk",
+            "Revenue concentration",
+            "Package coverage gaps",
+        }
+
+        for r in reports or []:
+            for f in (r.get("findings", []) or []):
+                if str(f.get("severity") or "").strip() == "High":
+                    cat = str(f.get("category") or "").strip()
+                    if cat in critical_categories:
+                        return True
+        return False
+
     # -------------------------
     # Coverage vars (define ONCE)
     # -------------------------
@@ -2640,8 +2830,6 @@ def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
     # -------------------------
     # Aggregate estimated opportunity ranges across units (define ONCE)
     # -------------------------
-    # unit format:
-    # r["estimated_contextual_ranges"] = [{"stream": "...", "estimated_range_usd": {"low":..., "high":...}, "confidence": "..."}]
     agg: Dict[str, Dict[str, Any]] = {}  # stream -> {"low": sum, "high": sum, "conf_counts": {...}}
 
     for r in unit_reports:
@@ -2660,52 +2848,70 @@ def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
             agg[stream]["conf_counts"][conf] = agg[stream]["conf_counts"].get(conf, 0) + 1
 
     # -------------------------
-    # Title + Header
+    # Header labels (human-friendly)
     # -------------------------
-    title = doc.add_heading("Royalty Intelligence — Package Executive Report", level=1)
-    title.alignment = WD_ALIGN_PARAGRAPH.LEFT
-
-    source_name = package_meta.get("source_path", "Package")
-    doc.add_paragraph(f"Source: {source_name}")
-    doc.add_paragraph(f"Units analyzed: {rollup.get('unit_count', len(units))}")
+    artist_label = infer_artist_label(unit_reports)
+    common_window = pick_common_window(unit_reports)
+    statements_analyzed = int(rollup.get("unit_count", len(units)) or len(units) or 0)
 
     # Total revenue across units
     total_revenue = float(sum(float(u.get("total_amount", 0) or 0) for u in units))
-    doc.add_paragraph(f"Total reported revenue (all units): {money(total_revenue)}")
-    doc.add_paragraph("")
+
+    # -------------------------
+    # Title + Header (REMOVE technical source path)
+    # -------------------------
+    title = doc.add_heading("Royalty Intelligence — Executive Package Report", level=1)
+    title.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    # Artist + window line (BM-friendly)
+    if common_window:
+        doc.add_paragraph(f"{artist_label} — Reporting window: {common_window}")
+    else:
+        doc.add_paragraph(f"{artist_label}")
+
+    doc.add_paragraph(f"Statements analyzed: {statements_analyzed}")
+    doc.add_paragraph(f"Total reported revenue (uploaded statements): {money(total_revenue)}")
+
+    dashed_divider()
 
     # =====================================================
-    # EXECUTIVE SNAPSHOT
+    # EXECUTIVE SNAPSHOT (split integrity vs opportunity)
     # =====================================================
     doc.add_heading("Executive Snapshot", level=2)
 
     total_low = float(sum(float(v.get("low", 0) or 0) for v in agg.values()))
     total_high = float(sum(float(v.get("high", 0) or 0) for v in agg.values()))
 
-    # Structural risk scoring
-    risk_score = 0
-    if missing:
-        risk_score += 2
+    critical_gaps = has_critical_reporting_gaps(unit_reports, coverage)
+    integrity_text = (
+        "Critical reporting gaps may exist — investigate missing coverage, missing periods, or concentration risks."
+        if critical_gaps
+        else "No critical reporting gaps identified in uploaded statements."
+    )
 
-    for s in (cross_signals or []):
-        sev = str(s.get("severity") or "Medium").strip()
-        if sev == "High":
-            risk_score += 2
-        elif sev == "Medium":
-            risk_score += 1
+    doc.add_paragraph("Reporting Integrity:")
+    doc.add_paragraph(integrity_text, style="List Bullet")
 
-    if risk_score >= 5:
-        structural_risk = "High"
-    elif risk_score >= 2:
-        structural_risk = "Medium"
+    doc.add_paragraph("Optimization Opportunity Range:")
+    # Rename from “Implied Missing Revenue Range” to avoid confusion
+    if total_low > 0 or total_high > 0:
+        doc.add_paragraph(
+            f"Estimated additional revenue capture potential: {money(total_low)} – {money(total_high)}",
+            style="List Bullet",
+        )
     else:
-        structural_risk = "Low"
+        doc.add_paragraph("Not enough data to estimate opportunity ranges.", style="List Bullet")
 
-    # Highest implied stream (by agg high)
+    # Highest leverage stream (by agg high)
     top_stream = None
     if agg:
-        ranked_streams = sorted(agg.items(), key=lambda kv: float(kv[1].get("high", 0) or 0), reverse=True)
+        ranked_streams = sorted(
+            agg.items(), key=lambda kv: float(kv[1].get("high", 0) or 0), reverse=True
+        )
         top_stream = ranked_streams[0][0]
+    if top_stream:
+        doc.add_paragraph("Highest Leverage Stream:")
+        doc.add_paragraph(str(top_stream), style="List Bullet")
 
     # Immediate action (strongest severity signal)
     immediate_action = None
@@ -2714,19 +2920,15 @@ def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
         strongest = sorted(
             cross_signals,
             key=lambda x: sev_rank.get(str(x.get("severity") or "Medium").strip(), 2),
-            reverse=True
+            reverse=True,
         )[0]
         immediate_action = strongest.get("recommended_action")
 
-    doc.add_paragraph(f"• Implied Missing Revenue Range: {money(total_low)} – {money(total_high)}")
-    doc.add_paragraph(f"• Structural Risk Level: {structural_risk}")
-
-    if top_stream:
-        doc.add_paragraph(f"• Highest Priority Stream: {top_stream}")
     if immediate_action:
-        doc.add_paragraph(f"• Immediate Action: {immediate_action}")
+        doc.add_paragraph("Recommended Next Step:")
+        doc.add_paragraph(str(immediate_action), style="List Bullet")
 
-    doc.add_paragraph("")
+    dashed_divider()
 
     # -------------------------
     # Coverage Summary
@@ -2734,26 +2936,27 @@ def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
     doc.add_heading("Statement Coverage", level=2)
 
     if present:
-        doc.add_paragraph("Coverage present:")
+        doc.add_paragraph("Present:")
         for k, v in present.items():
-            doc.add_paragraph(f"- {k} ({v} units)", style="List Bullet")
+            # ✅ remove redundant "-" (List Bullet already shows bullet)
+            doc.add_paragraph(f"{k} ({v} statements)", style="List Bullet")
 
     if missing:
-        doc.add_paragraph("Missing coverage:")
+        doc.add_paragraph("Missing:")
         for m in missing:
-            doc.add_paragraph(f"- {m}", style="List Bullet")
+            doc.add_paragraph(str(m), style="List Bullet")
 
     if recs:
         doc.add_paragraph("Recommended next uploads:")
         for r in recs:
-            doc.add_paragraph(f"- {r}", style="List Bullet")
+            doc.add_paragraph(str(r), style="List Bullet")
 
-    doc.add_paragraph("")
+    dashed_divider()
 
     # -------------------------
     # Package Estimated Opportunity Ranges
     # -------------------------
-    doc.add_heading("Estimated Opportunity Ranges (Package)", level=2)
+    doc.add_heading("Estimated Opportunity Ranges", level=2)
 
     if not agg:
         doc.add_paragraph(
@@ -2761,7 +2964,9 @@ def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
             "This typically means unit reports did not include estimated_contextual_ranges."
         )
     else:
-        ranked = sorted(agg.items(), key=lambda kv: float(kv[1].get("high", 0) or 0), reverse=True)
+        ranked = sorted(
+            agg.items(), key=lambda kv: float(kv[1].get("high", 0) or 0), reverse=True
+        )
 
         for stream, v in ranked[:6]:
             conf_counts = v.get("conf_counts", {}) or {}
@@ -2770,8 +2975,9 @@ def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
                 if conf_counts else "Unknown"
             )
 
+            # ✅ remove redundant "-" prefix
             doc.add_paragraph(
-                f"- {stream}: {money(v['low'])} – {money(v['high'])} (Confidence: {conf_mode})",
+                f"{stream}: {money(v['low'])} – {money(v['high'])} (Confidence: {conf_mode})",
                 style="List Bullet",
             )
 
@@ -2779,24 +2985,24 @@ def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
             "Note: Ranges are conservative and depend on registrations, splits, usage mix, reporting windows, and contract terms."
         )
 
-    doc.add_paragraph("")
+    dashed_divider()
 
     # -------------------------
-    # Top Revenue Units
+    # Top Revenue Statements (rename from “Units”)
     # -------------------------
-    doc.add_heading("Top Revenue Units", level=2)
+    doc.add_heading("Top Revenue Statements", level=2)
 
     top_units = sorted(units, key=lambda x: x.get("total_amount", 0) or 0, reverse=True)[:5]
     for u in top_units:
         doc.add_paragraph(
-            f"- {u.get('unit_name')}: {money(u.get('total_amount', 0) or 0)}",
-            style="List Bullet"
+            f"{u.get('unit_name')}: {money(u.get('total_amount', 0) or 0)}",
+            style="List Bullet",
         )
 
-    doc.add_paragraph("")
+    dashed_divider()
 
     # -------------------------
-    # Cross-stream intelligence signals (if present)
+    # Package-Level Intelligence Signals
     # -------------------------
     if cross_signals:
         doc.add_heading("Package-Level Intelligence Signals", level=2)
@@ -2807,16 +3013,17 @@ def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
             conf = str(s.get("confidence") or "Medium").strip()
             rec = str(s.get("recommended_action") or "").strip()
 
-            doc.add_paragraph(f"- {summ} (Impact: {sev} | Certainty: {conf})", style="List Bullet")
+            # ✅ remove redundant "-" prefix
+            doc.add_paragraph(f"{summ} (Impact: {sev} | Certainty: {conf})", style="List Bullet")
             if rec:
-                doc.add_paragraph(f"  Start here: {rec}")
+                doc.add_paragraph(f"Start here: {rec}")
 
-        doc.add_paragraph("")
+        dashed_divider()
 
     # -------------------------
-    # High severity findings across units
+    # Structural Reporting Review (replace confusing “High Risk Flags” wording)
     # -------------------------
-    doc.add_heading("High Risk Flags (Across Units)", level=2)
+    doc.add_heading("Structural Reporting Review", level=2)
 
     high_flags: List[str] = []
     for r in unit_reports:
@@ -2824,25 +3031,30 @@ def generate_master_package_docx(package_report: Dict[str, Any]) -> str:
             sev_val = f.get("severity")
             sev = str(sev_val).strip() if sev_val is not None else ""
             if sev == "High":
-                high_flags.append(str(f.get("summary") or "").strip())
+                summary = str(f.get("summary") or "").strip()
+                if summary:
+                    high_flags.append(summary)
 
     high_flags = [x for x in dict.fromkeys(high_flags) if x][:8]
 
     if high_flags:
         for flag in high_flags:
-            doc.add_paragraph(f"- {flag}", style="List Bullet")
+            doc.add_paragraph(flag, style="List Bullet")
     else:
-        doc.add_paragraph("No high severity findings detected.")
+        doc.add_paragraph("No critical reporting gaps identified in uploaded statements.")
 
     # -------------------------
     # Save
     # -------------------------
     filename_date = datetime.now().strftime("%Y-%m")
-    base_slug = Path(str(source_name)).stem.replace(" ", "_")
+    # Use a clean label for filename (no temp system paths)
+    base_slug = clean_filename(package_meta.get("source_path", "Package"))
+    base_slug = Path(base_slug).stem.replace(" ", "_")
     filename = f"RI_Master_Package_Report_{base_slug}_{filename_date}.docx"
 
     doc.save(filename)
     return filename
+
 
 
 
