@@ -1,133 +1,192 @@
-import os
 import tempfile
 from pathlib import Path
 
 import streamlit as st
+import pandas as pd
 
-# Import your working backend
+# Import your backend (keep this name aligned with your engine file)
 from royalty_mvp import (
     analyze_package,
     compute_cross_stream_diagnostics,
     generate_executive_docx,
     generate_master_package_docx,
-    write_report_json,
 )
 
 st.set_page_config(page_title="Royalty Intelligence", layout="wide")
 
-st.title("Royalty Intelligence")
-st.caption("Upload a royalty statement package to generate diagnostic reports.")
-
-uploaded = st.file_uploader(
-    "Upload statements package",
-    type=["zip", "xlsx", "xls", "csv", "tsv", "txt"]
+# -----------------------------
+# Minimal styling (optional)
+# -----------------------------
+st.markdown(
+    """
+    <style>
+      .block-container { padding-top: 2rem; padding-bottom: 2rem; }
+      div[data-testid="stMetricValue"] { font-size: 1.6rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-if st.button("Run Diagnostic"):
+# -----------------------------
+# Header
+# -----------------------------
+st.title("Royalty Intelligence")
+st.caption("Diagnostic layer for royalty recovery — intelligence before collection.")
+
+with st.container(border=True):
+    st.subheader("Upload statements package")
+    uploaded = st.file_uploader(
+        "Upload .zip, .xlsx, .csv, etc.",
+        type=["zip", "xlsx", "xls", "csv", "tsv", "txt"],
+        label_visibility="collapsed",
+    )
+    run = st.button("Run Diagnostic", type="primary", use_container_width=True)
+
+# -----------------------------
+# Main action
+# -----------------------------
+if run:
     if not uploaded:
         st.error("Please upload a file first.")
         st.stop()
 
-    # Save upload temporarily so your existing pipeline can read by file path
     suffix = Path(uploaded.name).suffix or ".zip"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded.getbuffer())
-        input_path = tmp.name
 
-    try:
-        st.info("Running analysis...")
+    # Work entirely inside a temporary directory to avoid any output folder behavior
+    with tempfile.TemporaryDirectory() as tmpdir_str:
+        tmpdir = Path(tmpdir_str)
 
-        # Run full package analysis
-        package_report = analyze_package(input_path)
+        # Save uploaded file into temp dir
+        input_path = tmpdir / f"upload{suffix}"
+        input_path.write_bytes(uploaded.getbuffer())
 
-        # Ensure cross-stream diagnostics exist
-        cross_stream = package_report.get("cross_stream_diagnostics") or compute_cross_stream_diagnostics(package_report)
-        package_report["cross_stream_diagnostics"] = cross_stream
-
-        # Attach package context to units (so unit docs reference package intelligence)
-        unit_reports = package_report.get("unit_reports", []) or []
-        package_coverage = package_report.get("package_coverage", {}) or {}
-
-        for r in unit_reports:
-            r["package_context"] = {
-                "package_coverage": package_coverage,
-                "cross_stream_diagnostics": cross_stream,
-            }
-
-        # Generate master DOCX
-        master_docx = generate_master_package_docx(package_report)
-
-        # Generate unit DOCX files
-        unit_doc_paths = []
-        for r in unit_reports:
-            docx_filename = generate_executive_docx(r)
-            unit_doc_paths.append(docx_filename)
-
-        # Save JSON temporarily
-        json_path = "royalty_intelligence_report.json"
-        write_report_json(package_report, json_path)
-
-        st.success("Diagnostic complete.")
-
-        # -------------------------
-        # Downloads
-        # -------------------------
-
-        st.subheader("Download Reports")
-
-        # Master report
-        with open(master_docx, "rb") as f:
-            st.download_button(
-                label="Download Master Package Report",
-                data=f,
-                file_name=Path(master_docx).name,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
-
-        # Unit reports
-        if unit_doc_paths:
-            st.subheader("Unit Reports")
-            for p in unit_doc_paths:
-                with open(p, "rb") as f:
-                    st.download_button(
-                        label=f"Download {Path(p).name}",
-                        data=f,
-                        file_name=Path(p).name,
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    )
-
-        # JSON
-        with open(json_path, "rb") as f:
-            st.download_button(
-                label="Download JSON Report",
-                data=f,
-                file_name=json_path,
-                mime="application/json",
-            )
-
-        # -------------------------
-        # Small On-Screen Summary
-        # -------------------------
-
-        st.subheader("Quick Summary")
-
-        rollup = package_report.get("workbook_rollup", {}) or {}
-        st.write("Units analyzed:", rollup.get("unit_count", 0))
-        st.write("Coverage present:", package_coverage.get("families_present", {}))
-        st.write("Missing coverage:", package_coverage.get("missing_families", []))
-
-        signals = (cross_stream.get("signals") or [])[:3]
-        if signals:
-            st.write("Top Signals:")
-            for s in signals:
-                st.write("•", s.get("summary"))
-
-    except Exception as e:
-        st.error(f"{type(e).__name__}: {e}")
-
-    finally:
         try:
-            os.remove(input_path)
-        except Exception:
-            pass
+            with st.spinner("Running analysis and generating reports..."):
+                # ------------------------------------------------------------------
+                # 1) Analysis (no verbose logs checkbox — always verbose=False)
+                # ------------------------------------------------------------------
+                package_report = analyze_package(str(input_path), verbose=False)
 
+                # ------------------------------------------------------------------
+                # 2) Cross-stream diagnostics
+                # ------------------------------------------------------------------
+                cross_stream = package_report.get("cross_stream_diagnostics") or compute_cross_stream_diagnostics(package_report)
+                package_report["cross_stream_diagnostics"] = cross_stream
+
+                # ------------------------------------------------------------------
+                # 3) Attach context to each unit (so unit DOCX can reference package intelligence)
+                # ------------------------------------------------------------------
+                unit_reports = package_report.get("unit_reports", []) or []
+                package_coverage = package_report.get("package_coverage", {}) or {}
+
+                for r in unit_reports:
+                    r["package_context"] = {
+                        "package_coverage": package_coverage,
+                        "cross_stream_diagnostics": cross_stream,
+                    }
+
+                # ------------------------------------------------------------------
+                # 4) Generate DOCX reports into temp dir (avoid writing to project root)
+                # ------------------------------------------------------------------
+                cwd = Path.cwd()
+                try:
+                    # temporarily generate in temp dir by switching cwd
+                    # (backend currently saves docx by filename with no output path)
+                    import os
+                    os.chdir(tmpdir)
+
+                    master_docx_name = generate_master_package_docx(package_report)
+                    master_docx_path = tmpdir / Path(master_docx_name).name
+                    master_docx_bytes = master_docx_path.read_bytes()
+
+                    unit_docs: list[tuple[str, bytes]] = []
+                    for r in unit_reports:
+                        unit_doc_name = generate_executive_docx(r)
+                        unit_path = tmpdir / Path(unit_doc_name).name
+                        unit_docs.append((unit_path.name, unit_path.read_bytes()))
+
+                finally:
+                    import os
+                    os.chdir(cwd)
+
+                # ------------------------------------------------------------------
+                # 5) JSON bytes (no file output)
+                # ------------------------------------------------------------------
+                import json
+                json_bytes = json.dumps(package_report, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+
+            st.success("Diagnostic complete.")
+
+            # -----------------------------
+            # Executive Snapshot (BM-friendly)
+            # -----------------------------
+            rollup = package_report.get("workbook_rollup", {}) or {}
+            units = rollup.get("units", []) or []
+            present = package_coverage.get("families_present", {}) or {}
+            missing = package_coverage.get("missing_families", []) or []
+
+            total_revenue = sum(float(u.get("total_amount", 0) or 0) for u in units)
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Units analyzed", int(rollup.get("unit_count", len(units)) or 0))
+            c2.metric("Total reported revenue", f"${total_revenue:,.0f}")
+            c3.metric("Coverage present", str(len(present)))
+            c4.metric("Coverage missing", str(len(missing)))
+
+            # -----------------------------
+            # Signals (top 3)
+            # -----------------------------
+            st.subheader("Top Intelligence Signals")
+            signals = (cross_stream.get("signals") or [])[:3]
+            if not signals:
+                st.write("No package-level signals detected.")
+            else:
+                for s in signals:
+                    sev = (s.get("severity") or "Medium")
+                    summ = (s.get("summary") or "").strip()
+                    rec = (s.get("recommended_action") or "").strip()
+                    with st.container(border=True):
+                        st.markdown(f"**[{sev}]** {summ}")
+                        if rec:
+                            st.caption(f"Start here: {rec}")
+
+            # -----------------------------
+            # Optional: Top units table + mini chart
+            # -----------------------------
+            st.subheader("Top Units by Revenue")
+            if units:
+                top_units = sorted(units, key=lambda x: x.get("total_amount", 0) or 0, reverse=True)[:10]
+                df_top = pd.DataFrame(
+                    [{"Unit": u.get("unit_name", "Unit"), "Revenue": float(u.get("total_amount", 0) or 0)} for u in top_units]
+                )
+                st.dataframe(df_top, use_container_width=True, hide_index=True)
+                st.bar_chart(df_top.set_index("Unit")["Revenue"])
+            else:
+                st.write("No unit rollup available.")
+
+            # -----------------------------
+            # Downloads
+            # -----------------------------
+            st.subheader("Download Reports")
+
+            st.download_button(
+                "Download Master Package Report",
+                data=master_docx_bytes,
+                file_name=master_docx_path.name,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+            )
+
+            if unit_docs:
+                with st.expander("Download Unit Reports"):
+                    for fname, b in unit_docs:
+                        st.download_button(
+                            label=f"Download {fname}",
+                            data=b,
+                            file_name=fname,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            use_container_width=True,
+                        )
+
+        except Exception as e:
+            st.error(f"{type(e).__name__}: {e}")
